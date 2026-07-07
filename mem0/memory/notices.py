@@ -10,6 +10,12 @@ from mem0.memory import telemetry as telemetry_module
 from mem0.memory.setup import _load_config, _write_config
 
 
+# DeepMem0: upstream "Mem0 Platform" marketing notices are permanently
+# disabled. Detection helpers stay (Memory.add/search call them), but this
+# module never prints to stderr, never A/B-tests users and never records
+# notice telemetry.
+NOTICES_DISABLED = True
+
 FLAG_KEY = "mem0-oss-notices"
 NOTICE_ID = "first_run"
 TEMPORAL_FEATURE_NOTICE_ID = "temporal_stub"
@@ -78,6 +84,8 @@ _scale_memory_count_threshold_evaluated_in_process = False
 
 
 def display_first_run_notice(memory_instance, sync_type: str, trigger_function: str) -> None:
+    if NOTICES_DISABLED:
+        return
     """Best-effort first-run notice check. Never raises or writes unless displayed."""
     if not telemetry_module.MEM0_TELEMETRY:
         return
@@ -159,6 +167,8 @@ def display_temporal_usage_notice(
     trigger_source: str,
     trigger_reason: str,
 ) -> None:
+    if NOTICES_DISABLED:
+        return
     """Best-effort temporal usage notice. Never raises or writes unless displayed."""
     if not telemetry_module.MEM0_TELEMETRY:
         return
@@ -293,6 +303,8 @@ def display_decay_usage_notice(
     delete_count: Optional[int] = None,
     deleted_count: Optional[int] = None,
 ) -> None:
+    if NOTICES_DISABLED:
+        return
     """Best-effort decay usage notice. Never raises or writes unless displayed."""
     if not telemetry_module.MEM0_TELEMETRY:
         return
@@ -471,6 +483,8 @@ def display_scale_threshold_notice(
     memory_count: Optional[int] = None,
     threshold: Optional[int] = None,
 ) -> None:
+    if NOTICES_DISABLED:
+        return
     """Best-effort scale notice. Never raises or writes unless displayed."""
     if not telemetry_module.MEM0_TELEMETRY:
         return
@@ -587,6 +601,8 @@ def display_performance_slow_query_notice(
     top_k: int,
     result_count: int,
 ) -> None:
+    if NOTICES_DISABLED:
+        return
     """Best-effort slow-query notice. Never raises or writes unless displayed."""
     if not telemetry_module.MEM0_TELEMETRY:
         return
