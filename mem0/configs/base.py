@@ -26,6 +26,46 @@ class MemoryItem(BaseModel):
     updated_at: Optional[str] = Field(None, description="The timestamp when the memory was updated")
 
 
+class MemoryDynamicsConfig(BaseModel):
+    """DeepMem0 v0.2: human-memory dynamics (ACT-R base-level activation).
+
+    Every memory lives on an evolving timeline; re-encounters reinforce it and
+    activation (frequency + recency in a single term) becomes a ranking signal.
+    Activation is computed lazily at query time — nothing is stored or decayed
+    in the background. Memories without a reinforcement history are neutral.
+    """
+
+    enabled: bool = Field(
+        description="Master switch for memory dynamics (reinforcement write-back and activation in ranking).",
+        default=True,
+    )
+    decay: float = Field(
+        description="ACT-R base-level decay exponent d (0.5 is the canonical value).",
+        default=0.5,
+    )
+    weight: float = Field(
+        description="Weight of the activation boost in ranking, both at fusion and after the"
+        " reranker. 0 disables the ranking term (write-back still records the timeline).",
+        default=0.15,
+    )
+    reinforcement_window: int = Field(
+        description="Seconds after a reinforcement during which further re-encounters of the"
+        " same memory have no reinforcement effect (absorbs client retries; approximates the"
+        " ACT-R spacing effect). 0 disables the window.",
+        default=3600,
+    )
+    max_timestamps: int = Field(
+        description="Reinforcement timestamps retained verbatim per memory; the older tail"
+        " folds into the Petrov (2006) approximation so payload stays O(K).",
+        default=10,
+    )
+    reinforce_on_search: bool = Field(
+        description="Also reinforce memories returned in the final top-k of a search"
+        " (async, fire-and-forget, never blocks the hot path).",
+        default=False,
+    )
+
+
 class MemoryConfig(BaseModel):
     vector_store: VectorStoreConfig = Field(
         description="Configuration for the vector store",
@@ -66,6 +106,10 @@ class MemoryConfig(BaseModel):
         " (effective pool = max(2*top_k, rerank_pool)). Pools beyond ~20 measured"
         " no quality gain at 3x the latency.",
         default=20,
+    )
+    dynamics: MemoryDynamicsConfig = Field(
+        description="DeepMem0 v0.2: human-memory dynamics (ACT-R activation) settings.",
+        default_factory=MemoryDynamicsConfig,
     )
 
 

@@ -55,6 +55,7 @@ def normalize_bm25(raw_score: float, midpoint: float, steepness: float) -> float
 
 
 ENTITY_BOOST_WEIGHT = 0.5
+ACTIVATION_BOOST_WEIGHT = 0.15
 
 
 def score_and_rank(
@@ -64,12 +65,14 @@ def score_and_rank(
     threshold: float,
     top_k: int,
     explain: bool = False,
+    activation_boosts: Optional[Dict[str, float]] = None,
+    activation_weight: float = ACTIVATION_BOOST_WEIGHT,
 ) -> List[Dict[str, Any]]:
     """Score candidates additively and return top-k results.
 
     For each candidate:
         semantic_score is taken from the result's score field.
-        combined = (semantic + bm25 + entity_boost) / max_possible
+        combined = (semantic + bm25 + entity_boost + activation) / max_possible
 
     Threshold gates the semantic score BEFORE combining -- candidates
     below the threshold are excluded even if BM25/entity would boost them.
@@ -79,6 +82,7 @@ def score_and_rank(
         - Semantic + BM25: max_possible = 2.0
         - Semantic + BM25 + entity: max_possible = 2.5
         - Semantic + entity (no BM25): max_possible = 1.5
+        - + activation (DeepMem0 v0.2): max_possible += activation_weight
 
     Args:
         semantic_results: Candidate memories from vector search.
@@ -87,18 +91,24 @@ def score_and_rank(
         threshold: Minimum semantic score required before hybrid scoring.
         top_k: Maximum number of results to return.
         explain: Include score_details in each result when true.
+        activation_boosts: DeepMem0 v0.2 — ACT-R activation boosts in [0, 1]
+            keyed by memory ID. Memories absent from the dict are neutral.
+        activation_weight: Weight of the activation term.
 
     Returns:
         List of scored result dicts sorted by combined score descending.
     """
     has_bm25 = bool(bm25_scores)
     has_entity = bool(entity_boosts)
+    has_activation = bool(activation_boosts) and activation_weight > 0
 
     max_possible = 1.0
     if has_bm25:
         max_possible += 1.0
     if has_entity:
         max_possible += ENTITY_BOOST_WEIGHT
+    if has_activation:
+        max_possible += activation_weight
 
     scored: List[Dict[str, Any]] = []
 
@@ -114,8 +124,9 @@ def score_and_rank(
         mem_id_str = str(mem_id)
         bm25_score = bm25_scores.get(mem_id_str, 0.0)
         entity_boost = entity_boosts.get(mem_id_str, 0.0)
+        activation = (activation_boosts.get(mem_id_str, 0.0) * activation_weight) if has_activation else 0.0
 
-        raw_combined = semantic_score + bm25_score + entity_boost
+        raw_combined = semantic_score + bm25_score + entity_boost + activation
         combined = min(raw_combined / max_possible, 1.0)
 
         scored_result = {
@@ -128,6 +139,7 @@ def score_and_rank(
                 "semantic_score": semantic_score,
                 "bm25_score": bm25_score,
                 "entity_boost": entity_boost,
+                "activation_boost": activation,
                 "raw_score": raw_combined,
                 "max_possible_score": max_possible,
                 "final_score": combined,
