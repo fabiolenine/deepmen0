@@ -67,15 +67,19 @@ def score_and_rank(
     explain: bool = False,
     activation_boosts: Optional[Dict[str, float]] = None,
     activation_weight: float = ACTIVATION_BOOST_WEIGHT,
+    penalties: Optional[Dict[str, float]] = None,
 ) -> List[Dict[str, Any]]:
     """Score candidates additively and return top-k results.
 
     For each candidate:
         semantic_score is taken from the result's score field.
         combined = (semantic + bm25 + entity_boost + activation) / max_possible
+        combined = max(combined - penalty, 0.0)   # DeepMem0 v0.3
 
     Threshold gates the semantic score BEFORE combining -- candidates
     below the threshold are excluded even if BM25/entity would boost them.
+    Penalties act on the FINAL normalized score, after the gate — they demote,
+    they can never exclude.
 
     The divisor adapts based on which signals are active:
         - Semantic only: max_possible = 1.0
@@ -94,6 +98,8 @@ def score_and_rank(
         activation_boosts: DeepMem0 v0.2 — ACT-R activation boosts in [0, 1]
             keyed by memory ID. Memories absent from the dict are neutral.
         activation_weight: Weight of the activation term.
+        penalties: DeepMem0 v0.3 — score penalties (e.g. superseded facts)
+            keyed by memory ID, subtracted from the final normalized score.
 
     Returns:
         List of scored result dicts sorted by combined score descending.
@@ -128,6 +134,9 @@ def score_and_rank(
 
         raw_combined = semantic_score + bm25_score + entity_boost + activation
         combined = min(raw_combined / max_possible, 1.0)
+        penalty = (penalties or {}).get(mem_id_str, 0.0)
+        if penalty:
+            combined = max(combined - penalty, 0.0)
 
         scored_result = {
             "id": mem_id_str,
@@ -140,6 +149,7 @@ def score_and_rank(
                 "bm25_score": bm25_score,
                 "entity_boost": entity_boost,
                 "activation_boost": activation,
+                "superseded_penalty": penalty,
                 "raw_score": raw_combined,
                 "max_possible_score": max_possible,
                 "final_score": combined,

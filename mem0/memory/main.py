@@ -80,6 +80,15 @@ from mem0.utils.scoring import (
     normalize_bm25,
     score_and_rank,
 )
+from mem0.utils.temporality import (
+    FIELD_SUPERSEDED_AT,
+    FIELD_SUPERSEDED_BY,
+    FIELD_SUPERSEDES,
+    parse_as_of,
+    parse_event_date,
+    parse_supersedes_ids,
+    superseded_penalty_applies,
+)
 from mem0.vector_stores.base import VectorStoreBase
 
 # Suppress SWIG deprecation warnings globally
@@ -427,6 +436,58 @@ def _dynamics_config(config) -> Optional[Any]:
     return dyn if dyn is not None and getattr(dyn, "enabled", False) else None
 
 
+def _temporality_config(config) -> Optional[Any]:
+    """The MemoryTemporalityConfig when temporality is enabled, else None."""
+    temp = getattr(config, "temporality", None)
+    return temp if temp is not None and getattr(temp, "enabled", False) else None
+
+
+def _mark_superseded(vector_store, db, new_id, new_text, old_ids) -> List[str]:
+    """DeepMem0 v0.3: mark old memories as superseded by a newly added fact.
+
+    Non-destructive: the old memory keeps living in the store (search demotes
+    it, an as_of anchor can restore it) and gains ``superseded_by`` +
+    ``superseded_at``. The first marking wins — an already-superseded memory
+    is never re-marked, so ``superseded_at`` stays immutable and chains
+    A -> B -> C emerge naturally. Every marking is recorded in the history DB
+    as a SUPERSEDED event. Full-payload merge; never raises — supersession is
+    bookkeeping and must not break the add.
+    """
+    now_iso = _dynamics_utcnow().isoformat()
+    marked: List[str] = []
+    for old_id in old_ids or []:
+        try:
+            if old_id == new_id:
+                continue
+            mem = vector_store.get(vector_id=old_id)
+            payload = getattr(mem, "payload", None) if mem is not None else None
+            if payload is None:
+                continue
+            if payload.get(FIELD_SUPERSEDED_BY):
+                continue
+            vector_store.update(
+                vector_id=old_id,
+                payload={**payload, FIELD_SUPERSEDED_BY: new_id, FIELD_SUPERSEDED_AT: now_iso},
+            )
+            try:
+                db.add_history(
+                    old_id,
+                    payload.get("data"),
+                    new_text,
+                    "SUPERSEDED",
+                    created_at=payload.get("created_at"),
+                    updated_at=now_iso,
+                    actor_id=payload.get("actor_id"),
+                    role=payload.get("role"),
+                )
+            except Exception as e:
+                logger.warning(f"Supersession history record failed for {old_id}: {e}")
+            marked.append(old_id)
+        except Exception as e:
+            logger.warning(f"Supersession marking failed for {old_id}: {e}")
+    return marked
+
+
 def _reinforce_memory(vector_store, dyn, memory_id, payload) -> bool:
     """One reinforcement event on a memory, honoring the reinforcement window.
 
@@ -465,40 +526,64 @@ def _reinforce_hits_in_background(vector_store, dyn, memory_ids) -> None:
     threading.Thread(target=_run, daemon=True, name="deepmem0-reinforce").start()
 
 
-def _apply_activation_post_rerank(memories, dyn) -> List[Dict[str, Any]]:
-    """Blend ACT-R activation into the reranked order.
+def _apply_post_rerank_adjustments(memories, dyn=None, temp=None, as_of=None) -> List[Dict[str, Any]]:
+    """Blend ACT-R activation (v0.2) and the superseded penalty (v0.3) into the
+    reranked order — in a SINGLE sort, so one adjustment never discards the other.
 
     The cross-encoder emits unbounded logits; they are squashed with a sigmoid
-    to (0, 1) and the activation boost is added at ``dyn.weight`` — enough to
-    break near-ties between equally-similar candidates (the human-memory
-    effect), not to overturn a decisive relevance gap. Memories without a
-    reinforcement history contribute 0 and keep their reranked order.
+    to (0, 1). Activation is added at ``dyn.weight`` — enough to break
+    near-ties between equally-similar candidates, not to overturn a decisive
+    relevance gap. The superseded penalty is subtracted at
+    ``temp.superseded_penalty`` — deliberately strong enough that a superseded
+    fact loses to its current replacement even when slightly more similar;
+    with an ``as_of`` anchor the penalty is waived for memories superseded
+    only after the anchor. Memories without dynamics/temporality fields keep
+    their reranked order.
     """
-    if not memories or dyn.weight <= 0:
+    dyn_active = dyn is not None and dyn.weight > 0
+    temp_active = temp is not None and temp.superseded_penalty > 0
+    if not memories or (not dyn_active and not temp_active):
         return memories
     now = _dynamics_utcnow()
     keyed = []
     for doc in memories:
         meta = doc.get("metadata") or {}
-        boost = boost_from_payload(
-            {
-                "reinforced_at": meta.get("reinforced_at"),
-                "access_count": meta.get("access_count"),
-                "created_at": doc.get("created_at"),
-            },
-            now=now,
-            decay=dyn.decay,
-        )
         rerank_score = doc.get("rerank_score")
         if rerank_score is None:
             base = doc.get("score") or 0.0
         else:
             base = 1.0 / (1.0 + math.exp(-rerank_score))
-        if boost > 0:
-            doc["activation"] = round(boost, 4)
-        keyed.append((base + dyn.weight * boost, doc))
+        adjusted = base
+        if dyn_active:
+            boost = boost_from_payload(
+                {
+                    "reinforced_at": meta.get("reinforced_at"),
+                    "access_count": meta.get("access_count"),
+                    "created_at": doc.get("created_at"),
+                },
+                now=now,
+                decay=dyn.decay,
+            )
+            if boost > 0:
+                doc["activation"] = round(boost, 4)
+            adjusted += dyn.weight * boost
+        if temp_active and superseded_penalty_applies(
+            {
+                FIELD_SUPERSEDED_BY: meta.get(FIELD_SUPERSEDED_BY),
+                FIELD_SUPERSEDED_AT: meta.get(FIELD_SUPERSEDED_AT),
+            },
+            as_of=as_of,
+        ):
+            doc["superseded_penalty"] = temp.superseded_penalty
+            adjusted -= temp.superseded_penalty
+        keyed.append((adjusted, doc))
     keyed.sort(key=lambda pair: pair[0], reverse=True)
     return [doc for _, doc in keyed]
+
+
+def _apply_activation_post_rerank(memories, dyn) -> List[Dict[str, Any]]:
+    """v0.2 entry point, kept as a thin wrapper over the combined adjuster."""
+    return _apply_post_rerank_adjustments(memories, dyn=dyn)
 
 
 setup_config()
