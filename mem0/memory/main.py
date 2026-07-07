@@ -1529,6 +1529,7 @@ class Memory(MemoryBase):
         domain: Optional[str] = None,
         memory_type: Optional[str] = None,
         sort_by_importance: bool = False,
+        as_of: Optional[str] = None,
         **kwargs,
     ):
         """
@@ -1572,6 +1573,11 @@ class Memory(MemoryBase):
         """
         if reference_date is not None:
             raise ValueError(get_temporal_feature_error_message("sync", "search", "reference_date"))
+
+        # DeepMem0 v0.3: as-of anchor — "what did I know / what held on that date".
+        as_of_iso, as_of_dt = (None, None)
+        if as_of is not None and _temporality_config(self.config) is not None:
+            as_of_iso, as_of_dt = parse_as_of(as_of)
 
         # Reject top-level entity params - must use filters instead
         _scope_kwargs = _extract_top_level_entity_params(kwargs)
@@ -1617,6 +1623,21 @@ class Memory(MemoryBase):
                     effective_filters.pop(fk, None)
             effective_filters.update(processed_filters)
 
+        # DeepMem0 v0.3: record-time anchor — only memories that already existed
+        # at the as_of instant participate (applies to the dense AND keyword
+        # legs, before the over-fetch; Qdrant auto-detects a DatetimeRange for
+        # ISO values). A caller-provided created_at bound is tightened, never
+        # loosened.
+        if as_of_iso is not None:
+            existing_created = effective_filters.get("created_at")
+            if isinstance(existing_created, dict):
+                current_lte = existing_created.get("lte")
+                existing_created["lte"] = (
+                    min(current_lte, as_of_iso) if isinstance(current_lte, str) else as_of_iso
+                )
+            else:
+                effective_filters["created_at"] = {"lte": as_of_iso}
+
         keys, encoded_ids = process_telemetry_filters(effective_filters)
         capture_event(
             "mem0.search",
@@ -1646,7 +1667,9 @@ class Memory(MemoryBase):
             fetch_limit = max(2 * limit, getattr(self.config, "rerank_pool", 20))
 
         search_start = time.perf_counter()
-        original_memories = self._search_vector_store(query, effective_filters, fetch_limit, threshold, explain=explain)
+        original_memories = self._search_vector_store(
+            query, effective_filters, fetch_limit, threshold, explain=explain, as_of_dt=as_of_dt
+        )
         search_elapsed_seconds = time.perf_counter() - search_start
 
         # Apply reranking if enabled and reranker is available
@@ -1654,12 +1677,16 @@ class Memory(MemoryBase):
             try:
                 reranked_memories = self.reranker.rerank(query, original_memories, fetch_limit)
                 original_memories = reranked_memories
-                # DeepMem0 v0.2: blend ACT-R activation into the reranked order
-                # (the fusion-stage boost only shapes the pool; the cross-encoder
-                # re-sorts it, so activation must also speak after the reranker).
+                # DeepMem0 v0.2/v0.3: blend ACT-R activation and the superseded
+                # penalty into the reranked order (the fusion-stage signals only
+                # shape the pool; the cross-encoder re-sorts it, so both must
+                # also speak after the reranker — in a single sort).
                 dyn = _dynamics_config(self.config)
-                if dyn is not None:
-                    original_memories = _apply_activation_post_rerank(original_memories, dyn)
+                temp = _temporality_config(self.config)
+                if dyn is not None or temp is not None:
+                    original_memories = _apply_post_rerank_adjustments(
+                        original_memories, dyn=dyn, temp=temp, as_of=as_of_dt
+                    )
             except Exception as e:
                 logger.warning(f"Reranking failed, using original results: {e}")
         # DeepMem0: cut the over-fetched pool back to the requested top_k.
@@ -1696,7 +1723,10 @@ class Memory(MemoryBase):
             )
         else:
             display_first_run_notice(self, "sync", "search")
-        return {"results": original_memories}
+        response = {"results": original_memories}
+        if as_of_iso is not None:
+            response["as_of"] = as_of_iso
+        return response
 
     def _process_metadata_filters(self, metadata_filters: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -1802,7 +1832,7 @@ class Memory(MemoryBase):
                 return True
         return False
 
-    def _search_vector_store(self, query, filters, limit, threshold=0.1, explain=False):
+    def _search_vector_store(self, query, filters, limit, threshold=0.1, explain=False, as_of_dt=None):
         # Guard against None threshold (backward compat)
         if threshold is None:
             threshold = 0.1
@@ -1862,6 +1892,16 @@ class Memory(MemoryBase):
                 if boost > 0:
                     activation_boosts[cand["id"]] = boost
 
+        # Step 7c (DeepMem0 v0.3): superseded facts are demoted, never excluded.
+        # Anchor-aware: with an as_of, a memory superseded only AFTER the anchor
+        # was still the current fact then, so its penalty is waived.
+        superseded_penalties = {}
+        temp = _temporality_config(self.config)
+        if temp is not None and temp.superseded_penalty > 0:
+            for cand in candidates:
+                if superseded_penalty_applies(cand["payload"], as_of=as_of_dt):
+                    superseded_penalties[cand["id"]] = temp.superseded_penalty
+
         # Step 8: Score and rank
         scored_results = score_and_rank(
             semantic_results=candidates,
@@ -1872,6 +1912,7 @@ class Memory(MemoryBase):
             explain=explain,
             activation_boosts=activation_boosts,
             activation_weight=dyn.weight if dyn is not None else 0.0,
+            penalties=superseded_penalties or None,
         )
 
         # Step 9: Format results
@@ -3192,6 +3233,7 @@ class AsyncMemory(MemoryBase):
         domain: Optional[str] = None,
         memory_type: Optional[str] = None,
         sort_by_importance: bool = False,
+        as_of: Optional[str] = None,
         **kwargs,
     ):
         """
@@ -3237,6 +3279,11 @@ class AsyncMemory(MemoryBase):
             raise ValueError(
                 await get_temporal_feature_error_message_async("async", "search", "reference_date")
             )
+
+        # DeepMem0 v0.3: as-of anchor — "what did I know / what held on that date".
+        as_of_iso, as_of_dt = (None, None)
+        if as_of is not None and _temporality_config(self.config) is not None:
+            as_of_iso, as_of_dt = parse_as_of(as_of)
 
         # Reject top-level entity params - must use filters instead
         _scope_kwargs = _extract_top_level_entity_params(kwargs)
@@ -3284,6 +3331,21 @@ class AsyncMemory(MemoryBase):
                     effective_filters.pop(fk, None)
             effective_filters.update(processed_filters)
 
+        # DeepMem0 v0.3: record-time anchor — only memories that already existed
+        # at the as_of instant participate (applies to the dense AND keyword
+        # legs, before the over-fetch; Qdrant auto-detects a DatetimeRange for
+        # ISO values). A caller-provided created_at bound is tightened, never
+        # loosened.
+        if as_of_iso is not None:
+            existing_created = effective_filters.get("created_at")
+            if isinstance(existing_created, dict):
+                current_lte = existing_created.get("lte")
+                existing_created["lte"] = (
+                    min(current_lte, as_of_iso) if isinstance(current_lte, str) else as_of_iso
+                )
+            else:
+                effective_filters["created_at"] = {"lte": as_of_iso}
+
         keys, encoded_ids = process_telemetry_filters(effective_filters)
         capture_event(
             "mem0.search",
@@ -3313,7 +3375,9 @@ class AsyncMemory(MemoryBase):
             fetch_limit = max(2 * limit, getattr(self.config, "rerank_pool", 20))
 
         search_start = time.perf_counter()
-        original_memories = await self._search_vector_store(query, effective_filters, fetch_limit, threshold, explain=explain)
+        original_memories = await self._search_vector_store(
+            query, effective_filters, fetch_limit, threshold, explain=explain, as_of_dt=as_of_dt
+        )
         search_elapsed_seconds = time.perf_counter() - search_start
 
         # Apply reranking if enabled and reranker is available
@@ -3324,10 +3388,13 @@ class AsyncMemory(MemoryBase):
                     self.reranker.rerank, query, original_memories, fetch_limit
                 )
                 original_memories = reranked_memories
-                # DeepMem0 v0.2: blend ACT-R activation into the reranked order.
+                # DeepMem0 v0.2/v0.3: activation + superseded penalty, single sort.
                 dyn = _dynamics_config(self.config)
-                if dyn is not None:
-                    original_memories = _apply_activation_post_rerank(original_memories, dyn)
+                temp = _temporality_config(self.config)
+                if dyn is not None or temp is not None:
+                    original_memories = _apply_post_rerank_adjustments(
+                        original_memories, dyn=dyn, temp=temp, as_of=as_of_dt
+                    )
             except Exception as e:
                 logger.warning(f"Reranking failed, using original results: {e}")
         # DeepMem0: cut the over-fetched pool back to the requested top_k.
@@ -3362,7 +3429,10 @@ class AsyncMemory(MemoryBase):
             )
         else:
             await display_first_run_notice_async(self, "async", "search")
-        return {"results": original_memories}
+        response = {"results": original_memories}
+        if as_of_iso is not None:
+            response["as_of"] = as_of_iso
+        return response
 
     def _process_metadata_filters(self, metadata_filters: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -3468,7 +3538,7 @@ class AsyncMemory(MemoryBase):
                 return True
         return False
 
-    async def _search_vector_store(self, query, filters, limit, threshold=0.1, explain=False):
+    async def _search_vector_store(self, query, filters, limit, threshold=0.1, explain=False, as_of_dt=None):
         if threshold is None:
             threshold = 0.1
 
@@ -3525,6 +3595,16 @@ class AsyncMemory(MemoryBase):
                 if boost > 0:
                     activation_boosts[cand["id"]] = boost
 
+        # Step 7c (DeepMem0 v0.3): superseded facts are demoted, never excluded.
+        # Anchor-aware: with an as_of, a memory superseded only AFTER the anchor
+        # was still the current fact then, so its penalty is waived.
+        superseded_penalties = {}
+        temp = _temporality_config(self.config)
+        if temp is not None and temp.superseded_penalty > 0:
+            for cand in candidates:
+                if superseded_penalty_applies(cand["payload"], as_of=as_of_dt):
+                    superseded_penalties[cand["id"]] = temp.superseded_penalty
+
         # Step 8: Score and rank
         scored_results = score_and_rank(
             semantic_results=candidates,
@@ -3535,6 +3615,7 @@ class AsyncMemory(MemoryBase):
             explain=explain,
             activation_boosts=activation_boosts,
             activation_weight=dyn.weight if dyn is not None else 0.0,
+            penalties=superseded_penalties or None,
         )
 
         # Step 9: Format results

@@ -194,6 +194,23 @@ class Qdrant(VectorStoreBase):
             except Exception as e:
                 logger.debug(f"Index for {field} might already exist: {e}")
 
+        # DeepMem0 v0.3: datetime indexes for the as-of anchor (created_at is
+        # filtered on every anchored search) and for future supersession-window
+        # filters. Index creation is online — existing collections gain these
+        # on the next startup without re-indexing any vectors.
+        datetime_fields = ["created_at", "superseded_at"]
+
+        for field in datetime_fields:
+            try:
+                self.client.create_payload_index(
+                    collection_name=self.collection_name,
+                    field_name=field,
+                    field_schema="datetime"
+                )
+                logger.info(f"Created datetime index for {field} in collection {self.collection_name}")
+            except Exception as e:
+                logger.debug(f"Datetime index for {field} might already exist: {e}")
+
     def insert(self, vectors: list, payloads: list = None, ids: list = None):
         """
         Insert vectors into a collection, including BM25 sparse vectors
