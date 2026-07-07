@@ -957,6 +957,64 @@ The attributed_to field should still reflect the original source: "user" for fac
 """
 
 
+# DeepMem0 v0.3: appended to ADDITIVE_EXTRACTION_PROMPT when semantic
+# temporality is enabled — same pattern as AGENT_CONTEXT_SUFFIX, so the base
+# prompt stays untouched and the feature reverts cleanly.
+TEMPORALITY_SUPERSESSION_SUFFIX = """
+
+## Supersession Detection
+
+Beyond linking, detect when a new fact REPLACES an existing memory. Add the
+existing memory's id to a "supersedes" array ONLY when ALL of these hold:
+- Same entity AND same specific attribute/slot — the same "field" of the world
+  (e.g. which database a project uses, where someone works, a chosen setting).
+- The new value REPLACES the old one: explicit change markers ("now", "no
+  longer", "changed to", "switched to", "used to be", "agora", "não mais",
+  "mudou para", "trocamos", "deixou de") or a direct factual contradiction
+  about a single-valued attribute.
+- NOT supersession: complementary details about the same topic (that is
+  linking); additive facts (a second hobby, another project, one more tool);
+  opinions that can coexist; uncertainty without an explicit change.
+
+When in doubt, use linked_memory_ids, NOT supersedes. A wrong supersedes mark
+demotes real information in future searches — be conservative.
+
+### Additional output field
+
+- **supersedes** (array of strings, optional): ids from the Existing Memories
+  list whose value this new memory replaces. Omit or pass [] if none.
+
+Example: Existing Memories contains {"id": "2", "text": "The user's Atlas
+project uses MySQL"}; the new message says "we migrated Atlas to Postgres
+yesterday" -> extract {"id": "0", "text": "The user migrated the Atlas
+project from MySQL to PostgreSQL", "attributed_to": "user", "supersedes": ["2"]}
+"""
+
+TEMPORALITY_EVENT_DATE_SUFFIX = """
+
+## Event Date
+
+When the message clearly anchors WHEN a fact happened or became true, add an
+"event_date" field with an ISO date (YYYY-MM-DD). Resolve relative expressions
+("yesterday", "last week", "ontem", "semana passada") against the Observation
+Date. If there is no clear temporal anchor, OMIT the field entirely. Never
+guess a date.
+
+### Additional output field
+
+- **event_date** (string, optional): ISO date (YYYY-MM-DD) when the fact
+  occurred or became true. Omit when the text gives no clear anchor.
+"""
+
+
+def build_temporality_suffix(include_event_date: bool = True) -> str:
+    """DeepMem0 v0.3: extraction-prompt suffix for semantic temporality."""
+    suffix = TEMPORALITY_SUPERSESSION_SUFFIX
+    if include_event_date:
+        suffix += TEMPORALITY_EVENT_DATE_SUFFIX
+    return suffix
+
+
 # ---------------------------------------------------------------------------
 # V3 Prompt Builder — constructs the user-side prompt for additive extraction
 # Ported from platform/backend/shared/core/utils/prompt_builder.py
