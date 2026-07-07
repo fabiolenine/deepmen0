@@ -4,13 +4,15 @@ import gc
 import hashlib
 import json
 import logging
+import math
 import os
+import threading
 import time
 import uuid
 import warnings
 from copy import deepcopy
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import ValidationError
 
@@ -63,6 +65,13 @@ from mem0.utils.factory import (
     LlmFactory,
     RerankerFactory,
     VectorStoreFactory,
+)
+from mem0.utils.dynamics import (
+    boost_from_payload,
+    init_dynamics_fields,
+    reinforcement_fields,
+    should_reinforce,
+    utcnow as _dynamics_utcnow,
 )
 from mem0.utils.lemmatization import lemmatize_for_bm25
 from mem0.utils.scoring import (
@@ -410,6 +419,86 @@ def _build_session_scope(filters):
 def _entity_collection_name(provider: str, collection_name: str) -> str:
     separator = "-" if provider == "s3_vectors" else "_"
     return f"{collection_name}{separator}entities"
+
+
+def _dynamics_config(config) -> Optional[Any]:
+    """The MemoryDynamicsConfig when dynamics is enabled, else None."""
+    dyn = getattr(config, "dynamics", None)
+    return dyn if dyn is not None and getattr(dyn, "enabled", False) else None
+
+
+def _reinforce_memory(vector_store, dyn, memory_id, payload) -> bool:
+    """One reinforcement event on a memory, honoring the reinforcement window.
+
+    Writes the FULL merged payload (not just the dynamics fields) so vector
+    stores that replace instead of merging payloads stay whole. Never raises —
+    reinforcement is bookkeeping and must not break add/update/search.
+    """
+    try:
+        payload = payload or {}
+        if not should_reinforce(payload, window_seconds=dyn.reinforcement_window):
+            return False
+        fields = reinforcement_fields(payload, max_timestamps=dyn.max_timestamps)
+        vector_store.update(vector_id=memory_id, payload={**payload, **fields})
+        return True
+    except Exception as e:
+        logger.warning(f"Reinforcement failed for memory {memory_id}: {e}")
+        return False
+
+
+def _reinforce_hits_in_background(vector_store, dyn, memory_ids) -> None:
+    """T3: reinforce searched-and-returned memories off the hot path.
+
+    Fire-and-forget daemon thread; each memory is re-fetched so the window
+    check and the merge run against fresh payload, not the search snapshot.
+    """
+
+    def _run():
+        for memory_id in memory_ids:
+            try:
+                mem = vector_store.get(vector_id=memory_id)
+                if mem is not None:
+                    _reinforce_memory(vector_store, dyn, memory_id, getattr(mem, "payload", None))
+            except Exception as e:
+                logger.debug(f"Access reinforcement skipped for {memory_id}: {e}")
+
+    threading.Thread(target=_run, daemon=True, name="deepmem0-reinforce").start()
+
+
+def _apply_activation_post_rerank(memories, dyn) -> List[Dict[str, Any]]:
+    """Blend ACT-R activation into the reranked order.
+
+    The cross-encoder emits unbounded logits; they are squashed with a sigmoid
+    to (0, 1) and the activation boost is added at ``dyn.weight`` — enough to
+    break near-ties between equally-similar candidates (the human-memory
+    effect), not to overturn a decisive relevance gap. Memories without a
+    reinforcement history contribute 0 and keep their reranked order.
+    """
+    if not memories or dyn.weight <= 0:
+        return memories
+    now = _dynamics_utcnow()
+    keyed = []
+    for doc in memories:
+        meta = doc.get("metadata") or {}
+        boost = boost_from_payload(
+            {
+                "reinforced_at": meta.get("reinforced_at"),
+                "access_count": meta.get("access_count"),
+                "created_at": doc.get("created_at"),
+            },
+            now=now,
+            decay=dyn.decay,
+        )
+        rerank_score = doc.get("rerank_score")
+        if rerank_score is None:
+            base = doc.get("score") or 0.0
+        else:
+            base = 1.0 / (1.0 + math.exp(-rerank_score))
+        if boost > 0:
+            doc["activation"] = round(boost, 4)
+        keyed.append((base + dyn.weight * boost, doc))
+    keyed.sort(key=lambda pair: pair[0], reverse=True)
+    return [doc for _, doc in keyed]
 
 
 setup_config()
@@ -935,13 +1024,14 @@ class Memory(MemoryBase):
                     logger.warning(f"Failed to embed memory text: {e}")
 
         # Phase 4: Per-memory CPU processing + Phase 5: Hash dedup
-        # Build set of existing hashes for dedup
-        existing_hashes = set()
+        # Build map of existing hashes for dedup (and DeepMem0 v0.2 reinforcement)
+        existing_by_hash = {}
         for mem in existing_results:
             h = mem.payload.get("hash") if hasattr(mem, "payload") and mem.payload else None
             if h:
-                existing_hashes.add(h)
+                existing_by_hash[h] = mem
 
+        dyn = _dynamics_config(self.config)
         records = []  # (memory_id, text, embedding, payload)
         seen_hashes = set()  # dedup within the current batch
         for mem in extracted_memories:
@@ -950,8 +1040,13 @@ class Memory(MemoryBase):
                 continue
 
             mem_hash = hashlib.md5(text.encode()).hexdigest()
-            if mem_hash in existing_hashes or mem_hash in seen_hashes:
+            if mem_hash in existing_by_hash or mem_hash in seen_hashes:
                 logger.debug(f"Skipping duplicate memory (hash match): {text[:50]}")
+                # DeepMem0 v0.2 (T1): a re-encountered fact is the strongest
+                # reinforcement signal — the upstream silent no-op becomes the hook.
+                existing = existing_by_hash.get(mem_hash)
+                if dyn is not None and existing is not None:
+                    _reinforce_memory(self.vector_store, dyn, existing.id, existing.payload)
                 continue
             seen_hashes.add(mem_hash)
 
@@ -967,6 +1062,9 @@ class Memory(MemoryBase):
             mem_metadata["updated_at"] = mem_metadata["created_at"]
             if mem.get("attributed_to"):
                 mem_metadata["attributed_to"] = mem["attributed_to"]
+            if dyn is not None:
+                # DeepMem0 v0.2: creation is the first encounter on the timeline.
+                init_dynamics_fields(mem_metadata, mem_metadata["created_at"])
 
             records.append((memory_id, text, embed_map[text], mem_metadata))
 
@@ -1435,6 +1533,12 @@ class Memory(MemoryBase):
             try:
                 reranked_memories = self.reranker.rerank(query, original_memories, fetch_limit)
                 original_memories = reranked_memories
+                # DeepMem0 v0.2: blend ACT-R activation into the reranked order
+                # (the fusion-stage boost only shapes the pool; the cross-encoder
+                # re-sorts it, so activation must also speak after the reranker).
+                dyn = _dynamics_config(self.config)
+                if dyn is not None:
+                    original_memories = _apply_activation_post_rerank(original_memories, dyn)
             except Exception as e:
                 logger.warning(f"Reranking failed, using original results: {e}")
         # DeepMem0: cut the over-fetched pool back to the requested top_k.
@@ -1446,6 +1550,15 @@ class Memory(MemoryBase):
             memory_type=memory_type,
             sort_by_importance=sort_by_importance,
         )
+
+        # DeepMem0 v0.2 (T3, opt-in): being retrieved is itself a re-encounter.
+        # Only the memories actually returned to the caller are reinforced,
+        # asynchronously, so the hot path never pays for the write-back.
+        dyn = _dynamics_config(self.config)
+        if dyn is not None and dyn.reinforce_on_search and original_memories:
+            _reinforce_hits_in_background(
+                self.vector_store, dyn, [doc["id"] for doc in original_memories if doc.get("id")]
+            )
 
         if temporal_usage_notice:
             display_temporal_usage_notice(self, "sync", "search", *temporal_usage_notice)
@@ -1616,6 +1729,18 @@ class Memory(MemoryBase):
                 "payload": mem.payload if hasattr(mem, 'payload') else {},
             })
 
+        # Step 7b (DeepMem0 v0.2): lazy ACT-R activation over the candidate pool.
+        # Derived from each candidate's reinforcement timeline at query time —
+        # memories without a history stay neutral (no key in the dict).
+        activation_boosts = {}
+        dyn = _dynamics_config(self.config)
+        if dyn is not None and dyn.weight > 0:
+            now = _dynamics_utcnow()
+            for cand in candidates:
+                boost = boost_from_payload(cand["payload"], now=now, decay=dyn.decay)
+                if boost > 0:
+                    activation_boosts[cand["id"]] = boost
+
         # Step 8: Score and rank
         scored_results = score_and_rank(
             semantic_results=candidates,
@@ -1624,6 +1749,8 @@ class Memory(MemoryBase):
             threshold=threshold,
             top_k=limit,
             explain=explain,
+            activation_boosts=activation_boosts,
+            activation_weight=dyn.weight if dyn is not None else 0.0,
         )
 
         # Step 9: Format results
@@ -1862,6 +1989,9 @@ class Memory(MemoryBase):
             new_metadata["created_at"] = datetime.now(timezone.utc).isoformat()
         new_metadata["updated_at"] = new_metadata["created_at"]
         new_metadata["text_lemmatized"] = lemmatize_for_bm25(data, language=self.config.language)
+        if _dynamics_config(self.config) is not None:
+            # DeepMem0 v0.2: creation is the first encounter on the timeline.
+            init_dynamics_fields(new_metadata, new_metadata["created_at"])
 
         self.vector_store.insert(
             vectors=[embeddings],
@@ -1946,6 +2076,17 @@ class Memory(MemoryBase):
         # actor_id is immutable after creation (issue #4490)
         if "actor_id" in existing_memory.payload:
             new_metadata["actor_id"] = existing_memory.payload["actor_id"]
+
+        # DeepMem0 v0.2 (T2): an updated fact is alive — reinforce its timeline.
+        # Inside the reinforcement window the content update still applies; only
+        # the reinforcement bookkeeping is suppressed (fields carry over as-is).
+        dyn = _dynamics_config(self.config)
+        if dyn is not None and should_reinforce(
+            existing_memory.payload, window_seconds=dyn.reinforcement_window
+        ):
+            new_metadata.update(
+                reinforcement_fields(existing_memory.payload, max_timestamps=dyn.max_timestamps)
+            )
 
         if data in existing_embeddings:
             embeddings = existing_embeddings[data]
@@ -2514,12 +2655,13 @@ class AsyncMemory(MemoryBase):
                     logger.warning(f"Failed to embed memory text (async): {e}")
 
         # Phase 4: Per-memory CPU processing + Phase 5: Hash dedup
-        existing_hashes = set()
+        existing_by_hash = {}
         for mem in existing_results:
             h = mem.payload.get("hash") if hasattr(mem, "payload") and mem.payload else None
             if h:
-                existing_hashes.add(h)
+                existing_by_hash[h] = mem
 
+        dyn = _dynamics_config(self.config)
         records = []
         seen_hashes = set()
         for mem in extracted_memories:
@@ -2528,8 +2670,14 @@ class AsyncMemory(MemoryBase):
                 continue
 
             mem_hash = hashlib.md5(text.encode()).hexdigest()
-            if mem_hash in existing_hashes or mem_hash in seen_hashes:
+            if mem_hash in existing_by_hash or mem_hash in seen_hashes:
                 logger.debug(f"Skipping duplicate memory (hash match, async): {text[:50]}")
+                # DeepMem0 v0.2 (T1): re-encounter reinforces the existing memory.
+                existing = existing_by_hash.get(mem_hash)
+                if dyn is not None and existing is not None:
+                    await asyncio.to_thread(
+                        _reinforce_memory, self.vector_store, dyn, existing.id, existing.payload
+                    )
                 continue
             seen_hashes.add(mem_hash)
 
@@ -2545,6 +2693,8 @@ class AsyncMemory(MemoryBase):
             mem_metadata["updated_at"] = mem_metadata["created_at"]
             if mem.get("attributed_to"):
                 mem_metadata["attributed_to"] = mem["attributed_to"]
+            if dyn is not None:
+                init_dynamics_fields(mem_metadata, mem_metadata["created_at"])
 
             records.append((memory_id, text, embed_map[text], mem_metadata))
 
@@ -3020,6 +3170,10 @@ class AsyncMemory(MemoryBase):
                     self.reranker.rerank, query, original_memories, fetch_limit
                 )
                 original_memories = reranked_memories
+                # DeepMem0 v0.2: blend ACT-R activation into the reranked order.
+                dyn = _dynamics_config(self.config)
+                if dyn is not None:
+                    original_memories = _apply_activation_post_rerank(original_memories, dyn)
             except Exception as e:
                 logger.warning(f"Reranking failed, using original results: {e}")
         # DeepMem0: cut the over-fetched pool back to the requested top_k.
@@ -3031,6 +3185,13 @@ class AsyncMemory(MemoryBase):
             memory_type=memory_type,
             sort_by_importance=sort_by_importance,
         )
+
+        # DeepMem0 v0.2 (T3, opt-in): reinforce returned memories off the hot path.
+        dyn = _dynamics_config(self.config)
+        if dyn is not None and dyn.reinforce_on_search and original_memories:
+            _reinforce_hits_in_background(
+                self.vector_store, dyn, [doc["id"] for doc in original_memories if doc.get("id")]
+            )
 
         if temporal_usage_notice:
             await display_temporal_usage_notice_async(self, "async", "search", *temporal_usage_notice)
@@ -3200,6 +3361,16 @@ class AsyncMemory(MemoryBase):
                 "payload": mem.payload if hasattr(mem, 'payload') else {},
             })
 
+        # Step 7b (DeepMem0 v0.2): lazy ACT-R activation over the candidate pool.
+        activation_boosts = {}
+        dyn = _dynamics_config(self.config)
+        if dyn is not None and dyn.weight > 0:
+            now = _dynamics_utcnow()
+            for cand in candidates:
+                boost = boost_from_payload(cand["payload"], now=now, decay=dyn.decay)
+                if boost > 0:
+                    activation_boosts[cand["id"]] = boost
+
         # Step 8: Score and rank
         scored_results = score_and_rank(
             semantic_results=candidates,
@@ -3208,6 +3379,8 @@ class AsyncMemory(MemoryBase):
             threshold=threshold,
             top_k=limit,
             explain=explain,
+            activation_boosts=activation_boosts,
+            activation_weight=dyn.weight if dyn is not None else 0.0,
         )
 
         # Step 9: Format results
@@ -3451,6 +3624,9 @@ class AsyncMemory(MemoryBase):
             new_metadata["created_at"] = datetime.now(timezone.utc).isoformat()
         new_metadata["updated_at"] = new_metadata["created_at"]
         new_metadata["text_lemmatized"] = lemmatize_for_bm25(data, language=self.config.language)
+        if _dynamics_config(self.config) is not None:
+            # DeepMem0 v0.2: creation is the first encounter on the timeline.
+            init_dynamics_fields(new_metadata, new_metadata["created_at"])
 
         await asyncio.to_thread(
             self.vector_store.insert,
@@ -3553,6 +3729,15 @@ class AsyncMemory(MemoryBase):
         # actor_id is immutable after creation (issue #4490)
         if "actor_id" in existing_memory.payload:
             new_metadata["actor_id"] = existing_memory.payload["actor_id"]
+
+        # DeepMem0 v0.2 (T2): an updated fact is alive — reinforce its timeline.
+        dyn = _dynamics_config(self.config)
+        if dyn is not None and should_reinforce(
+            existing_memory.payload, window_seconds=dyn.reinforcement_window
+        ):
+            new_metadata.update(
+                reinforcement_fields(existing_memory.payload, max_timestamps=dyn.max_timestamps)
+            )
 
         if data in existing_embeddings:
             embeddings = existing_embeddings[data]
