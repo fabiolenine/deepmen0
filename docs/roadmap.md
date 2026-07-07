@@ -82,9 +82,13 @@ Writes happen only at **reinforcement triggers**:
 - **T3 — hit on search** (optional, off by default): a memory returned in the **final top-k**
   (not the over-fetch pool) gets an async fire-and-forget bump — never blocking the hot path,
   best-effort by design.
-- A **reinforcement dedup window** (same fact hash within a configurable interval counts once)
-  protects against client retries — e.g. an MCP client that times out and re-sends an `add` must
-  not double-count.
+- A **reinforcement window** (`reinforcement_window`, default **1 hour**, `0` disables): after a
+  memory is reinforced, further re-encounters or hits on the *same* memory within the window have
+  **no reinforcement effect** — at most one reinforcement per memory per window, across all
+  triggers (a content UPDATE still applies; only the reinforcement bookkeeping is suppressed).
+  This absorbs client retries (an MCP client that times out and re-sends an `add` must not
+  double-count) and approximates the ACT-R **spacing effect**: massed repetition within the hour
+  adds nothing; spaced repetition does.
 
 - Payload fields: `access_count`, `reinforced_at` (timestamps), `last_accessed`. Bounded growth:
   keep only the most recent **K** timestamps (default ~10) plus the total count; older
