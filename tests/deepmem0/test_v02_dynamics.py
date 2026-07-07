@@ -12,6 +12,7 @@ from mem0.utils.dynamics import (
     activation_boost,
     base_level_activation,
     boost_from_payload,
+    init_dynamics_fields,
     reinforcement_fields,
     should_reinforce,
 )
@@ -114,16 +115,11 @@ class TestReinforcementFields:
         assert fields["reinforced_at"][-1] == NOW.isoformat()
         assert fields["access_count"] == 41
 
-    def test_creation_is_neutral_until_first_reinforcement(self):
-        # Option B: a freshly created memory (no dynamics fields) is neutral,
-        # exactly like the legacy corpus — no new-vs-old bias.
-        fresh = {"data": "boreal_app ships weekly", "created_at": hours_ago(0)}
-        assert boost_from_payload(fresh, now=NOW) == 0.0
-        # First reinforcement adopts created_at, yielding a two-event history.
-        fields = reinforcement_fields(fresh, now=NOW)
-        assert fields["reinforced_at"] == [hours_ago(0), NOW.isoformat()]
-        assert fields["access_count"] == 2
-        assert boost_from_payload({**fresh, **fields}, now=NOW) > 0.0
+    def test_init_fields_on_create(self):
+        metadata = {"data": "boreal_app ships weekly", "created_at": hours_ago(0)}
+        init_dynamics_fields(metadata, metadata["created_at"])
+        assert metadata["reinforced_at"] == [metadata["created_at"]]
+        assert metadata["access_count"] == 1
 
 
 class TestActivationInFusion:

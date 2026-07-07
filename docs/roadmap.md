@@ -101,11 +101,6 @@ Writes happen only at **reinforcement triggers**:
   keep only the most recent **K** timestamps (default ~10) plus the total count; older
   reinforcements fold into the standard ACT-R hybrid approximation (Petrov 2006) so payload size
   stays O(K) regardless of memory age.
-- **Creation is neutral**: a new memory carries no dynamics fields and gets zero activation until
-  its *first* reinforcement — creation is not itself an encounter. This keeps fresh adds on equal
-  footing with the legacy corpus (no new-vs-old bias) and makes activation a pure re-encounter
-  signal. On that first reinforcement the memory adopts its `created_at` as the first timestamp,
-  so its history starts with two events.
 - **Reinforcement on re-encounter**: upstream dedups identical facts by hash as a silent no-op;
   that exact spot becomes the reinforcement hook (increment + timestamp via `vector_store.update`).
 - **Reinforcement on access** (optional): bump on search hit — async/best-effort only, never

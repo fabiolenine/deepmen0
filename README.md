@@ -81,20 +81,20 @@ Honest notes:
 
 ## Status
 
-**v0.2 shipped** — human-memory dynamics are live. Memories accrue a reinforcement timeline
-(`reinforced_at` + `access_count`); re-encountering a fact on `add` (upstream's silent hash-dedup
-no-op became the hook), updating it, or — opt-in — retrieving it reinforces that timeline, at most
-once per memory per window (default 1 h; absorbs client retries and approximates the ACT-R spacing
-effect). At query time the ACT-R base-level activation `B_i = ln(Σ Δt_j^{-d})` is computed lazily
-over the candidate pool and blended into ranking twice: as an additive term in hybrid fusion and
-as a tie-breaker on top of the cross-encoder after reranking. No batch decay jobs, no stored
-weights going stale — time passing lowers activation by itself. **A memory is neutral until its
-first reinforcement** — creation alone does not put it on the timeline — so activation measures
-re-encounters, not first presentations, and neither the existing corpus nor fresh adds are
-repriced until they are actually re-used. Proof lives in `eval/eval_temporal.py`: reinforced twins
-outrank their equally-similar unreinforced siblings 6/6 (control without dynamics: 2/6), a
-decisively more relevant match is *not* overturned by reinforcement, and on a fresh corpus
-dynamics ON == OFF.
+**v0.2 shipped** — human-memory dynamics are live. Every memory carries an evolving
+reinforcement timeline (`reinforced_at` + `access_count`); re-encountering a fact on `add`
+(upstream's silent hash-dedup no-op became the hook), updating it, or — opt-in — retrieving it
+reinforces that timeline, at most once per memory per window (default 1 h; absorbs client
+retries and approximates the ACT-R spacing effect). At query time the ACT-R base-level
+activation `B_i = ln(Σ Δt_j^{-d})` is computed lazily over the candidate pool and blended into
+ranking twice: as an additive term in hybrid fusion and as a tie-breaker on top of the
+cross-encoder after reranking. No batch decay jobs, no stored weights going stale — time passing
+lowers activation by itself. A newly added fact joins the timeline at creation (boost 0.5,
+decaying), so recent facts stay salient; the Δt clamp guarantees mere freshness never outranks a
+genuinely reinforced memory, and the pre-v0.2 legacy corpus stays neutral until first
+re-encountered. Proof lives in `eval/eval_temporal.py`: reinforced twins outrank their
+equally-similar unreinforced siblings 6/6 (control without dynamics: 2/6), a decisively more
+relevant match is *not* overturned by reinforcement, and on a fresh corpus dynamics ON == OFF.
 
 **v0.1** — first-class multilingual retrieval: `language` in `MemoryConfig` (wired through BM25,
 lemmatization and the extraction prompt), snake_case-safe BM25 indexing, fail-safe spaCy
