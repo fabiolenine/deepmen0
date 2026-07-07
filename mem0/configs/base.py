@@ -55,6 +55,12 @@ class MemoryConfig(BaseModel):
         description="Custom instructions for fact extraction",
         default=None,
     )
+    language: str = Field(
+        description="DeepMem0: ISO 639-1 language of the memory corpus (e.g. 'pt')."
+        " Wires through BM25 stemming/stopwords, BM25 text normalization and the"
+        " extraction prompt. 'en' preserves upstream mem0 behavior.",
+        default="en",
+    )
 
 
 class AzureConfig(BaseModel):

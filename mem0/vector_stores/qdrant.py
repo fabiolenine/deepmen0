@@ -39,6 +39,7 @@ class Qdrant(VectorStoreBase):
         api_key: str = None,
         https: bool | None = None,
         on_disk: bool = False,
+        language: str | None = None,
     ):
         """
         Initialize the Qdrant vector store.
@@ -83,6 +84,10 @@ class Qdrant(VectorStoreBase):
         self.collection_name = collection_name
         self.embedding_model_dims = embedding_model_dims
         self.on_disk = on_disk
+        # DeepMem0: language for the BM25 sparse encoder (Snowball name).
+        from mem0.utils.languages import resolve_bm25_language
+
+        self.language = resolve_bm25_language(language) if language else None
         self._bm25_encoder = None
         # Whether this collection has the `bm25` named sparse vector slot.
         # Pre-v3 collections lack it; writing a `bm25` sparse vector into such a
@@ -95,8 +100,17 @@ class Qdrant(VectorStoreBase):
         if self._bm25_encoder is None:
             try:
                 from fastembed import SparseTextEmbedding
-                self._bm25_encoder = SparseTextEmbedding(model_name="Qdrant/bm25")
-                logger.info("BM25 encoder loaded (fastembed Qdrant/bm25)")
+
+                # DeepMem0: language-aware stemmer/stopwords. English (the
+                # fastembed default) keeps upstream-identical token IDs.
+                encoder_kwargs = {"model_name": "Qdrant/bm25"}
+                if self.language and self.language != "english":
+                    encoder_kwargs["language"] = self.language
+                self._bm25_encoder = SparseTextEmbedding(**encoder_kwargs)
+                logger.info(
+                    "BM25 encoder loaded (fastembed Qdrant/bm25, language=%s)",
+                    self.language or "english",
+                )
             except ImportError:
                 logger.warning("fastembed not installed — BM25 keyword search disabled. Install with: pip install fastembed")
                 self._bm25_encoder = False  # sentinel: tried and failed

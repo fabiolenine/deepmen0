@@ -15,16 +15,41 @@ results (e.g., "meeting" as noun vs verb -> different lemmas).
 from __future__ import annotations
 
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 
+_COMPOUND_SEP_RE = re.compile(r"[_\-]+")
 
-def lemmatize_for_bm25(text: str) -> str:
-    """Lemmatize text for BM25 matching.
 
-    Returns space-joined lemmas for full-text search. Falls back to
-    the original text if spaCy is unavailable.
+def normalize_compounds(text: str) -> str:
+    """Split snake_case/kebab-case compounds into plain words.
+
+    DeepMem0 fix: upstream fed compounds straight into spaCy, whose
+    ``lemma.isalnum()`` filter silently DROPPED any token containing ``_`` —
+    identifiers like ``feature_store_v2`` vanished from the BM25 index
+    entirely. Splitting first preserves every part, for every language, and
+    must be applied identically to documents and queries.
     """
+    return _COMPOUND_SEP_RE.sub(" ", text or "")
+
+
+def lemmatize_for_bm25(text: str, language: str = "en") -> str:
+    """Normalize text for BM25 matching.
+
+    English keeps the upstream spaCy lemmatization (on compound-normalized
+    text). Other languages return lowercased normalized text and delegate
+    morphology to the BM25 encoder's language-aware Snowball stemmer — the
+    pipeline DeepMem0 validated on a Portuguese corpus (the English
+    lemmatizer is noise, or worse, on non-English text).
+
+    Falls back to the normalized text if spaCy is unavailable.
+    """
+    text = normalize_compounds(text)
+
+    if (language or "en").strip().lower() not in ("en", "english"):
+        return text.lower()
+
     from mem0.utils.spacy_models import get_nlp_lemma
 
     nlp = get_nlp_lemma()

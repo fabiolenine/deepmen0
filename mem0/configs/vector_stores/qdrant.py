@@ -20,6 +20,11 @@ class QdrantConfig(BaseModel):
         None,
         description="Whether to force HTTPS on or off. Explicit schemes in url take precedence.",
     )
+    language: Optional[str] = Field(
+        None,
+        description="DeepMem0: BM25 sparse encoder language (ISO code or Snowball"
+        " name). When unset, Memory injects MemoryConfig.language automatically.",
+    )
     on_disk: Optional[bool] = Field(False,description="Enables persistent storage. Vectors are kept on disk (True) or in memory (False). Does not delete the local database path.")
 
     @model_validator(mode="before")

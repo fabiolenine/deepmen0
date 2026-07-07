@@ -59,7 +59,7 @@ def get_nlp_full():
 
             _nlp_full = spacy.load("en_core_web_sm")
             logger.info("spaCy full model loaded")
-        except Exception as e:
+        except BaseException as e:  # DeepMem0: spacy.cli.download may sys.exit(1)
             logger.warning(f"Failed to load spaCy full model: {e}")
             _load_failed_full = True
             return None
@@ -84,7 +84,7 @@ def get_nlp_lemma():
 
             _nlp_lemma = spacy.load("en_core_web_sm", disable=["ner", "parser"])
             logger.info("spaCy lemma model loaded")
-        except Exception as e:
+        except BaseException as e:  # DeepMem0: spacy.cli.download may sys.exit(1)
             logger.warning(f"Failed to load spaCy lemma model: {e}")
             _load_failed_lemma = True
             return None

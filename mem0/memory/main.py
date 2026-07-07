@@ -408,6 +408,15 @@ class Memory(MemoryBase):
     def __init__(self, config: MemoryConfig = MemoryConfig()):
         self.config = config
 
+        # DeepMem0: propagate the corpus language into the vector store's BM25
+        # encoder unless the user pinned vector_store.config.language explicitly.
+        if (
+            getattr(self.config, "language", "en") != "en"
+            and self.config.vector_store.provider == "qdrant"
+            and getattr(self.config.vector_store.config, "language", None) is None
+        ):
+            self.config.vector_store.config.language = self.config.language
+
         self.embedding_model = EmbedderFactory.create(
             self.config.embedder.provider,
             self.config.embedder.config,
@@ -832,6 +841,9 @@ class Memory(MemoryBase):
             new_messages=parsed_messages,
             last_k_messages=last_messages,
             custom_instructions=custom_instr,
+            # DeepMem0: extract facts in the input's language for non-English
+            # corpora (upstream ships this flag but never sets it).
+            use_input_language=(getattr(self.config, "language", "en") != "en"),
         )
 
         try:
@@ -901,7 +913,7 @@ class Memory(MemoryBase):
                 continue
             seen_hashes.add(mem_hash)
 
-            text_lemmatized = lemmatize_for_bm25(text)
+            text_lemmatized = lemmatize_for_bm25(text, language=self.config.language)
 
             memory_id = str(uuid.uuid4())
             mem_metadata = deepcopy(metadata)
@@ -1491,7 +1503,7 @@ class Memory(MemoryBase):
             threshold = 0.1
 
         # Step 1: Preprocess query
-        query_lemmatized = lemmatize_for_bm25(query)
+        query_lemmatized = lemmatize_for_bm25(query, language=self.config.language)
         query_entities = extract_entities(query)
 
         # Step 2: Embed query
@@ -1778,7 +1790,7 @@ class Memory(MemoryBase):
         if "created_at" not in new_metadata:
             new_metadata["created_at"] = datetime.now(timezone.utc).isoformat()
         new_metadata["updated_at"] = new_metadata["created_at"]
-        new_metadata["text_lemmatized"] = lemmatize_for_bm25(data)
+        new_metadata["text_lemmatized"] = lemmatize_for_bm25(data, language=self.config.language)
 
         self.vector_store.insert(
             vectors=[embeddings],
@@ -1856,7 +1868,7 @@ class Memory(MemoryBase):
 
         new_metadata["data"] = data
         new_metadata["hash"] = hashlib.md5(data.encode()).hexdigest()
-        new_metadata["text_lemmatized"] = lemmatize_for_bm25(data)
+        new_metadata["text_lemmatized"] = lemmatize_for_bm25(data, language=self.config.language)
         new_metadata["created_at"] = existing_memory.payload.get("created_at")
         new_metadata["updated_at"] = datetime.now(timezone.utc).isoformat()
 
@@ -1972,6 +1984,15 @@ class Memory(MemoryBase):
 class AsyncMemory(MemoryBase):
     def __init__(self, config: MemoryConfig = MemoryConfig()):
         self.config = config
+
+        # DeepMem0: propagate the corpus language into the vector store's BM25
+        # encoder unless the user pinned vector_store.config.language explicitly.
+        if (
+            getattr(self.config, "language", "en") != "en"
+            and self.config.vector_store.provider == "qdrant"
+            and getattr(self.config.vector_store.config, "language", None) is None
+        ):
+            self.config.vector_store.config.language = self.config.language
 
         self.embedding_model = EmbedderFactory.create(
             self.config.embedder.provider,
@@ -2371,6 +2392,9 @@ class AsyncMemory(MemoryBase):
             new_messages=parsed_messages,
             last_k_messages=last_messages,
             custom_instructions=custom_instr,
+            # DeepMem0: extract facts in the input's language for non-English
+            # corpora (upstream ships this flag but never sets it).
+            use_input_language=(getattr(self.config, "language", "en") != "en"),
         )
 
         try:
@@ -2438,7 +2462,7 @@ class AsyncMemory(MemoryBase):
                 continue
             seen_hashes.add(mem_hash)
 
-            text_lemmatized = lemmatize_for_bm25(text)
+            text_lemmatized = lemmatize_for_bm25(text, language=self.config.language)
 
             memory_id = str(uuid.uuid4())
             mem_metadata = deepcopy(metadata)
@@ -3034,7 +3058,7 @@ class AsyncMemory(MemoryBase):
             threshold = 0.1
 
         # Step 1: Preprocess query (CPU-bound)
-        query_lemmatized = await asyncio.to_thread(lemmatize_for_bm25, query)
+        query_lemmatized = await asyncio.to_thread(lemmatize_for_bm25, query, self.config.language)
         query_entities = await asyncio.to_thread(extract_entities, query)
 
         # Step 2: Embed query
@@ -3326,7 +3350,7 @@ class AsyncMemory(MemoryBase):
         if "created_at" not in new_metadata:
             new_metadata["created_at"] = datetime.now(timezone.utc).isoformat()
         new_metadata["updated_at"] = new_metadata["created_at"]
-        new_metadata["text_lemmatized"] = lemmatize_for_bm25(data)
+        new_metadata["text_lemmatized"] = lemmatize_for_bm25(data, language=self.config.language)
 
         await asyncio.to_thread(
             self.vector_store.insert,
@@ -3422,7 +3446,7 @@ class AsyncMemory(MemoryBase):
 
         new_metadata["data"] = data
         new_metadata["hash"] = hashlib.md5(data.encode()).hexdigest()
-        new_metadata["text_lemmatized"] = lemmatize_for_bm25(data)
+        new_metadata["text_lemmatized"] = lemmatize_for_bm25(data, language=self.config.language)
         new_metadata["created_at"] = existing_memory.payload.get("created_at")
         new_metadata["updated_at"] = datetime.now(timezone.utc).isoformat()
 
