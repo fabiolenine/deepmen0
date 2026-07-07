@@ -24,10 +24,12 @@ at query time, only for the candidates being ranked. There is no batch decay
 job and no persisted weight to refresh — as wall-clock time passes every dt
 grows and activation falls on its own, with zero writes.
 
-Memories without a reinforcement history (e.g. created before v0.2) are
-NEUTRAL: they receive no boost and no penalty, so enabling dynamics never
-reprices an existing corpus. A memory joins the timeline on its first
-reinforcement, adopting its ``created_at`` as the first encounter.
+Creation does NOT put a memory on the timeline. A memory is NEUTRAL — no boost,
+no penalty — until it is reinforced for the first time; only then does it join
+the timeline, retroactively adopting its ``created_at`` as the first encounter.
+This keeps a brand-new fact on equal footing with the legacy corpus (activation
+measures re-encounters, not first presentations) and means enabling dynamics
+never reprices existing memories or biases fresh adds over old ones.
 
 Bounded growth: only the most recent ``max_timestamps`` reinforcements are
 retained verbatim; the older tail is folded into the standard ACT-R hybrid
@@ -77,13 +79,6 @@ def _parse_ts(value: Any) -> Optional[datetime]:
 
 def _age_days(ts: datetime, now: datetime) -> float:
     return max((now - ts).total_seconds() / 86400.0, _MIN_AGE_DAYS)
-
-
-def init_dynamics_fields(metadata: Dict[str, Any], created_at: Optional[str] = None) -> None:
-    """Initialize the timeline on create: creation is the first encounter."""
-    ts = created_at or utcnow().isoformat()
-    metadata.setdefault(FIELD_REINFORCED_AT, [ts])
-    metadata.setdefault(FIELD_ACCESS_COUNT, 1)
 
 
 def base_level_activation(
@@ -192,9 +187,11 @@ def reinforcement_fields(
 ) -> Dict[str, Any]:
     """Updated dynamics fields for one reinforcement event.
 
-    A memory created before v0.2 (no history) joins the timeline here,
-    adopting its ``created_at`` as the first encounter. The returned dict
-    contains ONLY the dynamics fields, ready to be merged into the payload.
+    A memory not yet on the timeline (never reinforced, or created before v0.2)
+    joins it here, retroactively adopting its ``created_at`` as the first
+    encounter so its first reinforcement yields a two-event history. The
+    returned dict contains ONLY the dynamics fields, ready to merge into the
+    payload.
     """
     now = now or utcnow()
     history = list(payload.get(FIELD_REINFORCED_AT) or [])

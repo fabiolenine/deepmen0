@@ -68,7 +68,6 @@ from mem0.utils.factory import (
 )
 from mem0.utils.dynamics import (
     boost_from_payload,
-    init_dynamics_fields,
     reinforcement_fields,
     should_reinforce,
     utcnow as _dynamics_utcnow,
@@ -1062,9 +1061,8 @@ class Memory(MemoryBase):
             mem_metadata["updated_at"] = mem_metadata["created_at"]
             if mem.get("attributed_to"):
                 mem_metadata["attributed_to"] = mem["attributed_to"]
-            if dyn is not None:
-                # DeepMem0 v0.2: creation is the first encounter on the timeline.
-                init_dynamics_fields(mem_metadata, mem_metadata["created_at"])
+            # DeepMem0 v0.2: creation does NOT put the memory on the timeline —
+            # it stays neutral until its first reinforcement (T1/T2/T3).
 
             records.append((memory_id, text, embed_map[text], mem_metadata))
 
@@ -1989,9 +1987,7 @@ class Memory(MemoryBase):
             new_metadata["created_at"] = datetime.now(timezone.utc).isoformat()
         new_metadata["updated_at"] = new_metadata["created_at"]
         new_metadata["text_lemmatized"] = lemmatize_for_bm25(data, language=self.config.language)
-        if _dynamics_config(self.config) is not None:
-            # DeepMem0 v0.2: creation is the first encounter on the timeline.
-            init_dynamics_fields(new_metadata, new_metadata["created_at"])
+        # DeepMem0 v0.2: creation stays neutral until the first reinforcement.
 
         self.vector_store.insert(
             vectors=[embeddings],
@@ -2693,8 +2689,7 @@ class AsyncMemory(MemoryBase):
             mem_metadata["updated_at"] = mem_metadata["created_at"]
             if mem.get("attributed_to"):
                 mem_metadata["attributed_to"] = mem["attributed_to"]
-            if dyn is not None:
-                init_dynamics_fields(mem_metadata, mem_metadata["created_at"])
+            # DeepMem0 v0.2: creation stays neutral until the first reinforcement.
 
             records.append((memory_id, text, embed_map[text], mem_metadata))
 
@@ -3624,9 +3619,7 @@ class AsyncMemory(MemoryBase):
             new_metadata["created_at"] = datetime.now(timezone.utc).isoformat()
         new_metadata["updated_at"] = new_metadata["created_at"]
         new_metadata["text_lemmatized"] = lemmatize_for_bm25(data, language=self.config.language)
-        if _dynamics_config(self.config) is not None:
-            # DeepMem0 v0.2: creation is the first encounter on the timeline.
-            init_dynamics_fields(new_metadata, new_metadata["created_at"])
+        # DeepMem0 v0.2: creation stays neutral until the first reinforcement.
 
         await asyncio.to_thread(
             self.vector_store.insert,
