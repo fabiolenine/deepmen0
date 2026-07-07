@@ -1259,7 +1259,7 @@ class Memory(MemoryBase):
         top_k: int = 20,
         filters: Optional[Dict[str, Any]] = None,
         threshold: float = 0.1,
-        rerank: bool = False,
+        rerank: Optional[bool] = None,
         explain: bool = False,
         reference_date: Optional[Any] = None,
         **kwargs,
@@ -1364,17 +1364,31 @@ class Memory(MemoryBase):
             },
         )
 
+        # DeepMem0: a configured reranker is ON by default (upstream defaulted
+        # rerank=False, so a configured reranker silently never ran unless every
+        # caller opted in), and it sees an OVER-FETCHED candidate pool — reranking
+        # only the fused top-k cannot recover targets that the additive fusion
+        # buried under keyword-boosted competitors (measured on a PT corpus:
+        # hit@1 0.857 -> 0.886, one extra recall, with pool=20).
+        if rerank is None:
+            rerank = self.reranker is not None
+        fetch_limit = limit
+        if rerank and self.reranker:
+            fetch_limit = max(2 * limit, getattr(self.config, "rerank_pool", 20))
+
         search_start = time.perf_counter()
-        original_memories = self._search_vector_store(query, effective_filters, limit, threshold, explain=explain)
+        original_memories = self._search_vector_store(query, effective_filters, fetch_limit, threshold, explain=explain)
         search_elapsed_seconds = time.perf_counter() - search_start
 
         # Apply reranking if enabled and reranker is available
         if rerank and self.reranker and original_memories:
             try:
-                reranked_memories = self.reranker.rerank(query, original_memories, limit)
+                reranked_memories = self.reranker.rerank(query, original_memories, fetch_limit)
                 original_memories = reranked_memories
             except Exception as e:
                 logger.warning(f"Reranking failed, using original results: {e}")
+        # DeepMem0: cut the over-fetched pool back to the requested top_k.
+        original_memories = original_memories[:limit]
 
         if temporal_usage_notice:
             display_temporal_usage_notice(self, "sync", "search", *temporal_usage_notice)
@@ -2808,7 +2822,7 @@ class AsyncMemory(MemoryBase):
         top_k: int = 20,
         filters: Optional[Dict[str, Any]] = None,
         threshold: float = 0.1,
-        rerank: bool = False,
+        rerank: Optional[bool] = None,
         explain: bool = False,
         reference_date: Optional[Any] = None,
         **kwargs,
@@ -2917,8 +2931,20 @@ class AsyncMemory(MemoryBase):
             },
         )
 
+        # DeepMem0: a configured reranker is ON by default (upstream defaulted
+        # rerank=False, so a configured reranker silently never ran unless every
+        # caller opted in), and it sees an OVER-FETCHED candidate pool — reranking
+        # only the fused top-k cannot recover targets that the additive fusion
+        # buried under keyword-boosted competitors (measured on a PT corpus:
+        # hit@1 0.857 -> 0.886, one extra recall, with pool=20).
+        if rerank is None:
+            rerank = self.reranker is not None
+        fetch_limit = limit
+        if rerank and self.reranker:
+            fetch_limit = max(2 * limit, getattr(self.config, "rerank_pool", 20))
+
         search_start = time.perf_counter()
-        original_memories = await self._search_vector_store(query, effective_filters, limit, threshold, explain=explain)
+        original_memories = await self._search_vector_store(query, effective_filters, fetch_limit, threshold, explain=explain)
         search_elapsed_seconds = time.perf_counter() - search_start
 
         # Apply reranking if enabled and reranker is available
@@ -2926,11 +2952,13 @@ class AsyncMemory(MemoryBase):
             try:
                 # Run reranking in thread pool to avoid blocking async loop
                 reranked_memories = await asyncio.to_thread(
-                    self.reranker.rerank, query, original_memories, limit
+                    self.reranker.rerank, query, original_memories, fetch_limit
                 )
                 original_memories = reranked_memories
             except Exception as e:
                 logger.warning(f"Reranking failed, using original results: {e}")
+        # DeepMem0: cut the over-fetched pool back to the requested top_k.
+        original_memories = original_memories[:limit]
 
         if temporal_usage_notice:
             await display_temporal_usage_notice_async(self, "async", "search", *temporal_usage_notice)

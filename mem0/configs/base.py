@@ -61,6 +61,12 @@ class MemoryConfig(BaseModel):
         " extraction prompt. 'en' preserves upstream mem0 behavior.",
         default="en",
     )
+    rerank_pool: int = Field(
+        description="DeepMem0: minimum candidate pool handed to the reranker"
+        " (effective pool = max(2*top_k, rerank_pool)). Pools beyond ~20 measured"
+        " no quality gain at 3x the latency.",
+        default=20,
+    )
 
 
 class AzureConfig(BaseModel):
