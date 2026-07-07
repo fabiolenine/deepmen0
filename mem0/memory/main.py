@@ -22,6 +22,7 @@ from mem0.configs.prompts import (
     ADDITIVE_EXTRACTION_PROMPT,
     AGENT_CONTEXT_SUFFIX,
     PROCEDURAL_MEMORY_SYSTEM_PROMPT,
+    build_temporality_suffix,
     generate_additive_extraction_prompt,
 )
 from mem0.exceptions import ValidationError as Mem0ValidationError
@@ -1049,6 +1050,10 @@ class Memory(MemoryBase):
         system_prompt = ADDITIVE_EXTRACTION_PROMPT
         if is_agent_scoped:
             system_prompt += AGENT_CONTEXT_SUFFIX
+        temp = _temporality_config(self.config)
+        if temp is not None:
+            # DeepMem0 v0.3: same call also detects supersession (+ event_date).
+            system_prompt += build_temporality_suffix(include_event_date=temp.extract_event_date)
 
         custom_instr = prompt or self.custom_instructions
 
@@ -1118,6 +1123,7 @@ class Memory(MemoryBase):
 
         dyn = _dynamics_config(self.config)
         records = []  # (memory_id, text, embedding, payload)
+        pending_supersessions = []  # (new_memory_id, new_text, [old_ids]) — applied after persist
         seen_hashes = set()  # dedup within the current batch
         for mem in extracted_memories:
             text = mem.get("text")
@@ -1129,6 +1135,8 @@ class Memory(MemoryBase):
                 logger.debug(f"Skipping duplicate memory (hash match): {text[:50]}")
                 # DeepMem0 v0.2 (T1): a re-encountered fact is the strongest
                 # reinforcement signal — the upstream silent no-op becomes the hook.
+                # (An identical fact replaces nothing — its supersedes mark, if
+                # any, is ignored by design.)
                 existing = existing_by_hash.get(mem_hash)
                 if dyn is not None and existing is not None:
                     _reinforce_memory(self.vector_store, dyn, existing.id, existing.payload)
@@ -1150,6 +1158,18 @@ class Memory(MemoryBase):
             if dyn is not None:
                 # DeepMem0 v0.2: creation is the first encounter on the timeline.
                 init_dynamics_fields(mem_metadata, mem_metadata["created_at"])
+            if temp is not None:
+                # DeepMem0 v0.3: the LLM references existing memories by their
+                # presented index; resolve through uuid_mapping (hallucinated
+                # ids are discarded) and defer marking until after persist.
+                supersedes_ids = parse_supersedes_ids(mem.get("supersedes"), uuid_mapping)
+                if supersedes_ids:
+                    mem_metadata[FIELD_SUPERSEDES] = supersedes_ids
+                    pending_supersessions.append((memory_id, text, supersedes_ids))
+                if temp.extract_event_date:
+                    event_date = parse_event_date(mem.get("event_date"))
+                    if event_date:
+                        mem_metadata["event_date"] = event_date
 
             records.append((memory_id, text, embed_map[text], mem_metadata))
 
@@ -1175,6 +1195,17 @@ class Memory(MemoryBase):
                     self.vector_store.insert(vectors=[vec], ids=[mid], payloads=[pay])
                 except Exception as e:
                     logger.error(f"Failed to insert memory {mid}: {e}")
+
+        # DeepMem0 v0.3: mark superseded memories only AFTER the new facts are
+        # persisted (never point a memory at a replacement that failed to land).
+        superseded_events = []
+        if pending_supersessions:
+            try:
+                for new_id, new_text, old_ids in pending_supersessions:
+                    for old_id in _mark_superseded(self.vector_store, self.db, new_id, new_text, old_ids):
+                        superseded_events.append((old_id, new_id))
+            except Exception as e:
+                logger.warning(f"Supersession marking pass failed: {e}")
 
         # Batch history
         history_records = [
@@ -1308,6 +1339,11 @@ class Memory(MemoryBase):
             {"id": r[0], "memory": r[1], "event": "ADD"}
             for r in records
         ]
+        # DeepMem0 v0.3: surface supersessions to the caller (additive entries).
+        returned_memories.extend(
+            {"id": old_id, "event": "SUPERSEDED", "superseded_by": new_id}
+            for old_id, new_id in superseded_events
+        )
 
         keys, encoded_ids = process_telemetry_filters(filters)
         capture_event(
@@ -2681,6 +2717,10 @@ class AsyncMemory(MemoryBase):
         system_prompt = ADDITIVE_EXTRACTION_PROMPT
         if is_agent_scoped:
             system_prompt += AGENT_CONTEXT_SUFFIX
+        temp = _temporality_config(self.config)
+        if temp is not None:
+            # DeepMem0 v0.3: same call also detects supersession (+ event_date).
+            system_prompt += build_temporality_suffix(include_event_date=temp.extract_event_date)
 
         custom_instr = prompt or self.custom_instructions
 
@@ -2748,6 +2788,7 @@ class AsyncMemory(MemoryBase):
 
         dyn = _dynamics_config(self.config)
         records = []
+        pending_supersessions = []  # (new_memory_id, new_text, [old_ids]) — applied after persist
         seen_hashes = set()
         for mem in extracted_memories:
             text = mem.get("text")
@@ -2758,6 +2799,7 @@ class AsyncMemory(MemoryBase):
             if mem_hash in existing_by_hash or mem_hash in seen_hashes:
                 logger.debug(f"Skipping duplicate memory (hash match, async): {text[:50]}")
                 # DeepMem0 v0.2 (T1): re-encounter reinforces the existing memory.
+                # (An identical fact replaces nothing — supersedes mark ignored.)
                 existing = existing_by_hash.get(mem_hash)
                 if dyn is not None and existing is not None:
                     await asyncio.to_thread(
@@ -2780,6 +2822,16 @@ class AsyncMemory(MemoryBase):
                 mem_metadata["attributed_to"] = mem["attributed_to"]
             if dyn is not None:
                 init_dynamics_fields(mem_metadata, mem_metadata["created_at"])
+            if temp is not None:
+                # DeepMem0 v0.3: resolve LLM-referenced indices via uuid_mapping.
+                supersedes_ids = parse_supersedes_ids(mem.get("supersedes"), uuid_mapping)
+                if supersedes_ids:
+                    mem_metadata[FIELD_SUPERSEDES] = supersedes_ids
+                    pending_supersessions.append((memory_id, text, supersedes_ids))
+                if temp.extract_event_date:
+                    event_date = parse_event_date(mem.get("event_date"))
+                    if event_date:
+                        mem_metadata["event_date"] = event_date
 
             records.append((memory_id, text, embed_map[text], mem_metadata))
 
@@ -2805,6 +2857,18 @@ class AsyncMemory(MemoryBase):
                     await asyncio.to_thread(self.vector_store.insert, vectors=[vec], ids=[mid], payloads=[pay])
                 except Exception as e:
                     logger.error(f"Failed to insert memory {mid} (async): {e}")
+
+        # DeepMem0 v0.3: mark superseded memories only AFTER the new facts landed.
+        superseded_events = []
+        if pending_supersessions:
+            try:
+                for new_id, new_text, old_ids in pending_supersessions:
+                    marked = await asyncio.to_thread(
+                        _mark_superseded, self.vector_store, self.db, new_id, new_text, old_ids
+                    )
+                    superseded_events.extend((old_id, new_id) for old_id in marked)
+            except Exception as e:
+                logger.warning(f"Supersession marking pass failed (async): {e}")
 
         # Batch history
         history_records = [
@@ -2938,6 +3002,11 @@ class AsyncMemory(MemoryBase):
             {"id": r[0], "memory": r[1], "event": "ADD"}
             for r in records
         ]
+        # DeepMem0 v0.3: surface supersessions to the caller (additive entries).
+        returned_memories.extend(
+            {"id": old_id, "event": "SUPERSEDED", "superseded_by": new_id}
+            for old_id, new_id in superseded_events
+        )
 
         keys, encoded_ids = process_telemetry_filters(effective_filters)
         capture_event(
