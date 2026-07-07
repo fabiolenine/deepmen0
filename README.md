@@ -53,7 +53,7 @@ patches) and are being baked into this fork as first-class code.
 | Reranking | Interface exists, but `Memory.search` defaults `rerank=False` — a configured reranker **silently never runs** unless every caller opts in | Enabled by config default; multilingual cross-encoder on CPU (0 VRAM) *(v0.1)* |
 | Reranker pool | Reranks only the fused top-k — targets buried by fusion are unrecoverable | **Over-fetch** `max(2·limit, 20)` then cut back — measured +0.03 hit@1 / −1 miss *(v0.1)* |
 | Hybrid fusion | Candidate set built **from the dense retriever only**; BM25 can boost but never introduce a candidate | Mitigated today by over-fetch + rerank; true candidate union on the roadmap |
-| Frequency / recency (human memory) | **Paid platform only** — `decay` and `reference_date` raise errors in OSS | ACT-R base-level activation, open source *(v0.2)* |
+| Frequency / recency (human memory) | **Paid platform only** — `decay` and `reference_date` raise errors in OSS | ACT-R base-level activation as a ranking signal, reinforcement timeline per memory, open source *(v0.2, shipped)* |
 | Search-time metadata filters | Scope and payload filters | Plus `min_importance`, `domain`, `memory_type`, `sort_by_importance` *(v0.1)* |
 | Ops tooling | — | Re-index migration (embedder/language cutover), BM25 backfill, eval harness + synthetic PT/EN corpus |
 
@@ -81,32 +81,46 @@ Honest notes:
 
 ## Status
 
-**v0.1 shipped** — the fork carries the full mem0 v2.0.7 Python core with the multilingual
-retrieval baked in: `language` in `MemoryConfig` (wired through BM25, lemmatization and the
-extraction prompt), snake_case-safe BM25 indexing, fail-safe spaCy loading, reranker
-on-by-default with an over-fetched pool, and metadata-aware search filters. Validated in a
-self-hosted production deployment before release (numbers below).
+**v0.2 shipped** — human-memory dynamics are live. Every memory carries an evolving
+reinforcement timeline (`reinforced_at` + `access_count`); re-encountering a fact on `add`
+(upstream's silent hash-dedup no-op became the hook), updating it, or — opt-in — retrieving it
+reinforces that timeline, at most once per memory per window (default 1 h; absorbs client
+retries and approximates the ACT-R spacing effect). At query time the ACT-R base-level
+activation `B_i = ln(Σ Δt_j^{-d})` is computed lazily over the candidate pool and blended into
+ranking twice: as an additive term in hybrid fusion and as a tie-breaker on top of the
+cross-encoder after reranking. No batch decay jobs, no stored weights going stale — time passing
+lowers activation by itself. Memories without a timeline are neutral, so an existing corpus is
+never repriced. Proof lives in `eval/eval_temporal.py`: reinforced twins outrank their
+equally-similar unreinforced siblings 6/6 (control without dynamics: 2/6), a decisively more
+relevant match is *not* overturned by reinforcement, and on a fresh corpus dynamics ON == OFF.
+
+**v0.1** — first-class multilingual retrieval: `language` in `MemoryConfig` (wired through BM25,
+lemmatization and the extraction prompt), snake_case-safe BM25 indexing, fail-safe spaCy
+loading, reranker on-by-default with an over-fetched pool, metadata-aware search filters.
+Validated in a self-hosted production deployment before release (numbers below).
 
 Next, per `docs/roadmap.md`:
 
-- **v0.2 — Human-memory dynamics**: ACT-R base-level activation as a ranking term, reinforcement
-  write-back on re-encounter and (optionally, async) on access, configurable decay, non-destructive
-  archiving. Activation is computed lazily at query time from each memory's reinforcement
-  timeline — no batch decay jobs, no stored weights going stale.
 - **v0.3 — Semantic temporality**: fact validity and supersedence chains ("was X, now Y" as one
   evolving fact, not two memories), as-of queries, event-time anchoring.
 
-## API (v0.1)
+## API
 
 ```python
 from mem0 import Memory
 
 memory = Memory.from_config({
-    "language": "pt",                       # new: wired through BM25, lemmatizer, prompts
+    "language": "pt",                       # v0.1: wired through BM25, lemmatizer, prompts
     "embedder": {"provider": "ollama", "config": {"model": "bge-m3", "embedding_dims": 1024}},
     "reranker": {"provider": "sentence_transformer",
                  "config": {"model": "BAAI/bge-reranker-v2-m3", "device": "cpu"}},
     "vector_store": {"provider": "qdrant", "config": {"collection_name": "memories"}},
+    "dynamics": {                           # v0.2: human-memory dynamics (all optional)
+        "enabled": True,                    # on by default
+        "weight": 0.15,                     # activation's share of the ranking
+        "reinforcement_window": 3600,       # >=1 reinforcement/memory/hour, all triggers
+        "reinforce_on_search": False,       # T3: opt-in, async, never blocks the hot path
+    },
 })
 
 memory.add("O deploy do auth_service_v3 é feito por canary de 5% durante 24h.", user_id="demo")

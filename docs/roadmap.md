@@ -59,7 +59,14 @@ human-memory dynamics here is greenfield, no collision.
   (old kept as rollback). Idempotent, resumable.
 - Proof: harness numbers on the synthetic corpus, PT vs EN pipeline, published in the repo.
 
-## Phase 2 — Human-memory dynamics (v0.2)
+## Phase 2 — Human-memory dynamics (v0.2) — SHIPPED
+
+Measured on the temporal scenario (`eval/eval_temporal.py`, twin near-duplicate facts where one
+twin carries a lived reinforcement timeline): reinforced twin outranks its equally-similar
+sibling **6/6** with dynamics on (control without dynamics: 2/6 fusion, 3/6 reranked); a
+decisively more relevant match is **not** overturned by reinforcement; and on a fresh corpus
+(equal timelines) dynamics ON == OFF on every query — enabling the feature never reprices an
+existing corpus.
 
 Model: ACT-R **base-level activation** — `B_i = ln( Σ_j Δt_j^{-d} )` over each memory's
 reinforcement timestamps (`d ≈ 0.5`), a single term capturing both frequency (how many
@@ -132,6 +139,8 @@ MCP server, LLM-based metadata classifier and observability emitters live in a c
 - **v0.1**: `language="pt"` end-to-end; PT gains measured and versioned on the synthetic corpus;
   zero personal data in the repo; LICENSE + NOTICE; README.
 - **v0.2**: activation influencing ranking, measured on the temporal scenario without regressing
-  the non-temporal baseline; reinforcement write-back idempotent and concurrency-safe.
+  the non-temporal baseline; reinforcement write-back idempotent and concurrency-safe. **DONE**
+  (6/6 reinforced-twin wins on both ranking paths; decisive-gap guard holds; fresh-corpus
+  ON == OFF; write-back full-payload merge + windowed, failures never raise into the hot path).
 - **v0.3**: supersedence chain recorded on update; as-of search anchor working end-to-end;
   superseded facts retrievable as history, never silently lost.
