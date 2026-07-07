@@ -91,7 +91,10 @@ Next, per `docs/roadmap.md`:
 
 - **v0.2 — Human-memory dynamics**: ACT-R base-level activation as a ranking term, reinforcement
   write-back on re-encounter and (optionally, async) on access, configurable decay, non-destructive
-  archiving.
+  archiving. Activation is computed lazily at query time from each memory's reinforcement
+  timeline — no batch decay jobs, no stored weights going stale.
+- **v0.3 — Semantic temporality**: fact validity and supersedence chains ("was X, now Y" as one
+  evolving fact, not two memories), as-of queries, event-time anchoring.
 
 ## API (v0.1)
 
@@ -158,7 +161,8 @@ reranker configurado nunca executar), over-fetch do pool de rerank, filtros de m
 ferramentas de migração/avaliação e — o diferencial — frequência/recência de memória humana em
 código aberto, algo que no upstream existe só na plataforma paga.
 
-Roadmap: **v0.1** português de primeira classe; **v0.2** dinâmica de memória humana (ACT-R).
+Roadmap: **v0.1** português de primeira classe; **v0.2** dinâmica de memória humana (ACT-R);
+**v0.3** temporalidade semântica (validade e supersedência de fatos, consultas as-of).
 Detalhes em `docs/roadmap.md`. Licença Apache-2.0; atribuição ao Mem0 em `NOTICE`.
 
 Um projeto open-source da **Alpha Quant AI**.

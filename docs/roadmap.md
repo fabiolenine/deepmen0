@@ -65,7 +65,31 @@ Model: ACT-R **base-level activation** — `B_i = ln( Σ_j Δt_j^{-d} )` over ea
 reinforcement timestamps (`d ≈ 0.5`), a single term capturing both frequency (how many
 reinforcements) and recency (how recent). Used as a ranking signal.
 
-- Payload fields: `access_count`, `reinforced_at` (timestamps), `last_accessed`.
+**Activation is derived, not stored.** What persists is the event history (timestamps); the
+activation value is computed lazily **at query time**, only for the over-fetched candidate pool
+(~20 items — pure arithmetic, microseconds). There is no batch decay job and no persisted weight
+to refresh: as wall-clock time passes, every `Δt` grows and activation falls on its own, with
+zero writes. A stored weight would be stale the moment it was written and would require periodic
+full-collection rescans; a lazy value is exact at the only moment it matters — ranking.
+
+Writes happen only at **reinforcement triggers**:
+
+- **T1 — re-encounter on add** (synchronous): upstream dedups an already-known fact by hash as a
+  silent no-op; that exact spot becomes the hook — `access_count += 1`, append to `reinforced_at`
+  via `vector_store.update`. Strongest signal ("the user said this again").
+- **T2 — LLM-decided UPDATE** of an existing memory: the fact evolved, therefore it is alive —
+  counts as a reinforcement on the same chain.
+- **T3 — hit on search** (optional, off by default): a memory returned in the **final top-k**
+  (not the over-fetch pool) gets an async fire-and-forget bump — never blocking the hot path,
+  best-effort by design.
+- A **reinforcement dedup window** (same fact hash within a configurable interval counts once)
+  protects against client retries — e.g. an MCP client that times out and re-sends an `add` must
+  not double-count.
+
+- Payload fields: `access_count`, `reinforced_at` (timestamps), `last_accessed`. Bounded growth:
+  keep only the most recent **K** timestamps (default ~10) plus the total count; older
+  reinforcements fold into the standard ACT-R hybrid approximation (Petrov 2006) so payload size
+  stays O(K) regardless of memory age.
 - **Reinforcement on re-encounter**: upstream dedups identical facts by hash as a silent no-op;
   that exact spot becomes the reinforcement hook (increment + timestamp via `vector_store.update`).
 - **Reinforcement on access** (optional): bump on search hit — async/best-effort only, never
@@ -78,6 +102,22 @@ reinforcements) and recency (how recent). Used as a ranking signal.
 - Proof: temporal scenario in the harness — reinforced facts must outrank equally-similar
   unreinforced competitors, with no regression on the non-temporal baseline.
 
+## Phase 3 — Semantic temporality (v0.3)
+
+Where v0.2 makes the **usage** timeline govern ranking, v0.3 makes the **content** timeline a
+first-class dimension:
+
+- **Fact validity & supersedence**: when a fact changes ("the embedder *was* X, is *now* Y"),
+  record an explicit supersedence chain (previous value, valid-from/valid-to) instead of two
+  unrelated memories. Foundation: the existing history table (ADD/UPDATE/DELETE per memory) plus
+  the v0.2 reinforcement hook, which already intercepts the exact dedup/update point.
+- **As-of queries**: "what did I know last March?" — search with a temporal anchor that filters
+  or re-scores candidates by validity interval.
+- **Event-time anchoring**: extract dates mentioned in the content so facts can be anchored to
+  when they *happened*, not when they were stored (upstream's `reference_date` is a paid-platform
+  stub — greenfield here, same as `decay`).
+- Non-goal: destructive rewrites. Superseded facts remain queryable as history.
+
 ## Out of core (companion repo)
 
 MCP server, LLM-based metadata classifier and observability emitters live in a companion project
@@ -89,3 +129,5 @@ MCP server, LLM-based metadata classifier and observability emitters live in a c
   zero personal data in the repo; LICENSE + NOTICE; README.
 - **v0.2**: activation influencing ranking, measured on the temporal scenario without regressing
   the non-temporal baseline; reinforcement write-back idempotent and concurrency-safe.
+- **v0.3**: supersedence chain recorded on update; as-of search anchor working end-to-end;
+  superseded facts retrievable as history, never silently lost.
