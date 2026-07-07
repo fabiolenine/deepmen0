@@ -1,0 +1,161 @@
+# Deep Mem0
+
+**Memory for AI agents that speaks Portuguese and remembers like a human — facts on an evolving timeline.**
+
+An open-source project by **Alpha Quant AI**.
+
+Deep Mem0 is an open-source fork of [Mem0](https://github.com/mem0ai/mem0) (v2.0.7, Apache-2.0)
+focused on two things the upstream OSS core does not do today:
+
+1. **First-class multilingual retrieval — Portuguese first.** Mem0's hybrid search pipeline is
+   English end-to-end (English BM25 stemmer/stopwords, English spaCy lemmatization, English-centric
+   default embedder). On a Portuguese corpus this silently destroys recall — e.g. the English
+   lemmatizer *drops* snake_case tokens entirely, so a memory mentioning `feature_store_v2` becomes
+   unfindable by keyword. Deep Mem0 makes language a **config field** and wires it through every
+   layer: BM25 sparse encoding, lemmatization/normalization, extraction prompt, embedder and
+   reranker defaults.
+
+2. **Human-like memorization (ACT-R).** Deep Mem0 memorizes the way people do: every fact lives
+   on an **evolving timeline** — each time it is re-encountered or used it gets *reinforced* and
+   surfaces more readily, so what matters to you *now* is what you recall first. This is modeled
+   with the ACT-R **base-level activation** equation — `B_i = ln(Σ Δt_j^{-d})` over each fact's
+   reinforcement history — used as a ranking signal: frequency and recency of use shape relevance.
+   Nothing is ever silently deleted; stale facts simply yield the spotlight to living ones.
+   In upstream OSS these concepts exist only as paid-platform stubs; here they are real, local
+   and open.
+
+## Why (measured motivation)
+
+This fork was born from running a self-hosted Mem0 on a real, mostly-Portuguese memory corpus.
+Fixing the language pipeline and the ranking produced, on a private 35-query golden set:
+
+| configuration | hit@1 | MRR | misses@10 |
+|---|---|---|---|
+| stock hybrid pipeline (EN, base reranker) | 0.60 | 0.63 | 12/35 |
+| multilingual rebuild (bge-m3 + PT BM25 + v2-m3 reranker + over-fetch) | **0.886** | **0.929** | **1/35** |
+
+That private golden set cannot be published (it is made of real personal memories), so this repo
+ships a **synthetic PT+EN corpus** (`eval/corpus_synthetic.json`) exercising the same failure
+modes — Portuguese morphology, snake_case compounds, cross-lingual queries, paraphrase without
+lexical overlap, near-duplicates — plus the evaluation harness to reproduce the numbers on it.
+
+## Deep Mem0 vs. Mem0 OSS — what actually changes
+
+Portuguese scores are the headline, but not the whole story. Every row below was verified against
+the upstream 2.0.7 source; v0.1 items are already validated in a production deployment (as runtime
+patches) and are being baked into this fork as first-class code.
+
+| Capability | Mem0 OSS 2.0.7 | Deep Mem0 |
+|---|---|---|
+| Retrieval language | English hardcoded in three layers (BM25 stemmer/stopwords, spaCy `en_core_web_sm`, EN-centric embedder default) | `language` config field wired through BM25, lemmatization, extraction prompt and model defaults *(v0.1)* |
+| snake_case identifiers | Silently **dropped from the BM25 index** by the EN lemmatizer (`lemma.isalnum()` rejects `_`) — `feature_store_v2` becomes unfindable by keyword | Preserved via identical doc+query normalization (`_`/`-` → space) *(v0.1)* |
+| Missing spaCy model | `spacy.cli.download()` calls `sys.exit(1)` → **crashes the whole process on every search** | Graceful degradation to raw text; flagged, never fatal *(v0.1)* |
+| Reranking | Interface exists, but `Memory.search` defaults `rerank=False` — a configured reranker **silently never runs** unless every caller opts in | Enabled by config default; multilingual cross-encoder on CPU (0 VRAM) *(v0.1)* |
+| Reranker pool | Reranks only the fused top-k — targets buried by fusion are unrecoverable | **Over-fetch** `max(2·limit, 20)` then cut back — measured +0.03 hit@1 / −1 miss *(v0.1)* |
+| Hybrid fusion | Candidate set built **from the dense retriever only**; BM25 can boost but never introduce a candidate | Mitigated today by over-fetch + rerank; true candidate union on the roadmap |
+| Frequency / recency (human memory) | **Paid platform only** — `decay` and `reference_date` raise errors in OSS | ACT-R base-level activation, open source *(v0.2)* |
+| Search-time metadata filters | Scope and payload filters | Plus `min_importance`, `domain`, `memory_type`, `sort_by_importance` *(v0.1)* |
+| Ops tooling | — | Re-index migration (embedder/language cutover), BM25 backfill, eval harness + synthetic PT/EN corpus |
+
+## Benchmark on the synthetic corpus (reproducible)
+
+Measured with this repo's harness on the shipped synthetic corpus (44 memories, 28 queries,
+Portuguese-majority with English and cross-lingual cases), all self-hosted on the same machine:
+
+| pipeline | hit@1 | hit@5 | MRR | misses@10 | p50 |
+|---|---|---|---|---|---|
+| Mem0 OSS-style (EN BM25 + EN lemmatizer + EN-centric embedder, fused) | 0.750 | 0.964 | 0.833 | 1/28 | 0.2 s |
+| Deep Mem0 — language fix only (bge-m3 + PT BM25, fused) | 0.857 | **1.000** | 0.906 | **0/28** | 1.2 s |
+| Deep Mem0 — full (+ multilingual reranker, over-fetch 20) | **0.964** | 0.964 | **0.968** | **0/28** | 5.0 s |
+
+Honest notes:
+- The language fix **alone** already eliminates all misses at fusion-level latency; the CPU
+  cross-encoder buys the last hit@1 points at a latency cost — it is a dial, not a requirement.
+- The stand-in for upstream's embedder is `nomic-embed-text` (local, English-centric), since the
+  actual OSS default (OpenAI) requires an external API; the BM25 and lemmatization paths are
+  exactly the stock code.
+- This corpus is small (44 points). On a real 498-point production corpus the same comparison was
+  **hit@1 0.60 → 0.886** — the gap widens as the corpus grows and distractors multiply.
+- Latency measured on 2015-era Xeons with the reranker on CPU; reproduce with
+  `eval/seed_corpus.py` + `eval/eval_retrieval.py`.
+
+## Status
+
+Pre-release. Roadmap (see `docs/roadmap.md`):
+
+- **v0.1 — Portuguese first-class** (in progress): `language` in `MemoryConfig`, language-aware
+  BM25 + lemmatization (with fail-safe spaCy fallback), `use_input_language` extraction, multilingual
+  embedder/reranker defaults, reranker over-fetch, re-index migration tool.
+- **v0.2 — Human-memory dynamics**: ACT-R base-level activation as a ranking term, reinforcement
+  write-back on re-encounter and (optionally, async) on access, configurable decay, non-destructive
+  archiving.
+
+## Planned API (v0.1)
+
+```python
+from mem0 import Memory
+
+memory = Memory.from_config({
+    "language": "pt",                       # new: wired through BM25, lemmatizer, prompts
+    "embedder": {"provider": "ollama", "config": {"model": "bge-m3", "embedding_dims": 1024}},
+    "reranker": {"provider": "sentence_transformer",
+                 "config": {"model": "BAAI/bge-reranker-v2-m3", "device": "cpu"}},
+    "vector_store": {"provider": "qdrant", "config": {"collection_name": "memories"}},
+})
+
+memory.add("O deploy do auth_service_v3 é feito por canary de 5% durante 24h.", user_id="demo")
+memory.search("como fazemos deploy do serviço de autenticação?", user_id="demo", rerank=True)
+```
+
+## Evaluation harness
+
+```bash
+# 1. seed the synthetic corpus into a local Qdrant (throwaway collection)
+python eval/seed_corpus.py --collection deepmem0_demo
+
+# 2. per-retriever sanity: rank of each expected target in dense and BM25, no fusion
+python eval/eval_retrieval.py audit
+
+# 3. end-to-end metrics against a running mem0-compatible MCP server
+python eval/eval_retrieval.py run --label my_run --mcp http://localhost:8081/mcp
+```
+
+## Relationship to upstream
+
+Deep Mem0 tracks Mem0 v2.0.7 as its base and stays intentionally close to upstream design
+(same config surface, same vector-store contract, additive scoring changes in pure functions).
+It is **not** affiliated with Mem0.ai. Attribution in `NOTICE`; license Apache-2.0 in `LICENSE`.
+
+---
+
+## Português
+
+**Memória para agentes de IA que fala português e memoriza como um humano: fatos numa linha do
+tempo evolutiva.**
+
+O Deep Mem0 é um fork open-source do [Mem0](https://github.com/mem0ai/mem0) com dois focos que o
+core OSS não cobre: (1) **retrieval multilíngue de primeira classe, começando pelo português** —
+o pipeline híbrido do Mem0 é inglês de ponta a ponta (stemmer/stopwords do BM25, lematização
+spaCy, embedder default), o que destrói o recall em corpus PT de forma silenciosa; aqui o idioma
+vira **campo de configuração** propagado por todas as camadas; e (2) **memorização como a humana**
+— cada fato vive numa linha do tempo que evolui com o uso: reencontrar ou usar um fato o
+**reforça** (frequência + recência via ativação base-level do **ACT-R**), então o que importa
+agora é o que vem à tona primeiro. Nada é apagado silenciosamente: fatos parados apenas cedem o
+palco aos que estão vivos.
+
+A motivação é medida: num golden set privado de 35 consultas majoritariamente em português,
+corrigir o pipeline de idioma levou hit@1 de 0.60 para **0.886** e MRR de 0.63 para **0.929**
+(misses de 12 para 1). Como o golden set real não pode ser publicado, este repositório inclui um
+**corpus sintético PT+EN** com os mesmos modos de falha e o harness para reproduzir os números.
+
+E o score em português é a manchete, não a história toda: a tabela **"Deep Mem0 vs. Mem0 OSS"**
+acima resume tudo que muda — snake_case preservado no índice BM25, servidor que não cai quando o
+modelo spaCy falta, reranker que realmente roda por default (no OSS o `rerank=False` faz um
+reranker configurado nunca executar), over-fetch do pool de rerank, filtros de metadata na busca,
+ferramentas de migração/avaliação e — o diferencial — frequência/recência de memória humana em
+código aberto, algo que no upstream existe só na plataforma paga.
+
+Roadmap: **v0.1** português de primeira classe; **v0.2** dinâmica de memória humana (ACT-R).
+Detalhes em `docs/roadmap.md`. Licença Apache-2.0; atribuição ao Mem0 em `NOTICE`.
+
+Um projeto open-source da **Alpha Quant AI**.

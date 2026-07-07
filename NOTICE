@@ -1,0 +1,21 @@
+Deep Mem0
+Copyright 2026 Alpha Quant AI and the Deep Mem0 Authors
+
+This product is a fork of Mem0 (https://github.com/mem0ai/mem0), version 2.0.7,
+developed by Mem0.ai and its contributors and licensed under the Apache License,
+Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0).
+
+Deep Mem0 modifies and extends Mem0 with, among other changes:
+  - First-class multilingual retrieval (Portuguese in addition to English):
+    language-aware BM25 sparse encoding, language-aware lemmatization with
+    fail-safe fallbacks, multilingual default embedder and reranker, and
+    reranker over-fetch.
+  - Human-memory dynamics: frequency (reinforcement) and recency (forgetting
+    curve) weighting of retrieval, based on ACT-R base-level activation.
+
+All original Mem0 code remains under the Apache License 2.0. All Deep Mem0
+modifications are likewise released under the Apache License 2.0 (see LICENSE).
+
+The synthetic evaluation corpus shipped in eval/ is fictional: every person,
+company, project and fact in it was invented for benchmarking purposes and any
+resemblance to real entities is coincidental.
