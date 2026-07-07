@@ -54,6 +54,7 @@ patches) and are being baked into this fork as first-class code.
 | Reranker pool | Reranks only the fused top-k — targets buried by fusion are unrecoverable | **Over-fetch** `max(2·limit, 20)` then cut back — measured +0.03 hit@1 / −1 miss *(v0.1)* |
 | Hybrid fusion | Candidate set built **from the dense retriever only**; BM25 can boost but never introduce a candidate | Mitigated today by over-fetch + rerank; true candidate union on the roadmap |
 | Frequency / recency (human memory) | **Paid platform only** — `decay` and `reference_date` raise errors in OSS | ACT-R base-level activation as a ranking signal, reinforcement timeline per memory, open source *(v0.2, shipped)* |
+| Fact evolution over time | Updated facts overwrite in place or coexist as unrelated near-duplicates; `reference_date` is a paid stub | Supersession chains detected at extraction ("was X, now Y" links old → new), superseded facts demoted-never-deleted, `as_of` time-travel search, optional `event_date` per fact *(v0.3, shipped)* |
 | Search-time metadata filters | Scope and payload filters | Plus `min_importance`, `domain`, `memory_type`, `sort_by_importance` *(v0.1)* |
 | Ops tooling | — | Re-index migration (embedder/language cutover), BM25 backfill, eval harness + synthetic PT/EN corpus |
 
@@ -81,7 +82,23 @@ Honest notes:
 
 ## Status
 
-**v0.2 shipped** — human-memory dynamics are live. Every memory carries an evolving
+**v0.3 shipped** — semantic temporality is live. Facts now live on a *content* timeline: when a
+new fact **replaces** an old one ("Atlas used MySQL" → "Atlas uses PostgreSQL"), the extraction
+LLM — in the same call that already runs on every add — marks the supersession; the old memory
+gains `superseded_by`/`superseded_at`, the new one records `supersedes`, and the chain lands in
+the history log as a `SUPERSEDED` event. Superseded facts are **demoted, never deleted or
+excluded**: a configurable ranking penalty (default 0.2, applied both at fusion and after the
+reranker, in a single sort combined with the ACT-R activation) makes the current fact win while
+the old one stays reachable. `search(..., as_of="2026-03-15")` restores the world as it was —
+memories created after the anchor are filtered out (a Qdrant datetime index backs the filter) and
+a memory superseded only *after* the anchor carries no penalty there. Extracted facts may also
+carry an `event_date` (when the text clearly anchors *when* something happened — event-time,
+distinct from record-time). Proof lives in `eval/eval_supersedence.py`: current fact outranks its
+superseded ancestor 3/3 on both ranking paths, the old fact stays reachable by its own phrasing
+3/3, the as-of anchor restores it 3/3, and an untouched corpus ranks identically with the feature
+on or off.
+
+**v0.2** — human-memory dynamics. Every memory carries an evolving
 reinforcement timeline (`reinforced_at` + `access_count`); re-encountering a fact on `add`
 (upstream's silent hash-dedup no-op became the hook), updating it, or — opt-in — retrieving it
 reinforces that timeline, at most once per memory per window (default 1 h; absorbs client
@@ -101,10 +118,8 @@ lemmatization and the extraction prompt), snake_case-safe BM25 indexing, fail-sa
 loading, reranker on-by-default with an over-fetched pool, metadata-aware search filters.
 Validated in a self-hosted production deployment before release (numbers below).
 
-Next, per `docs/roadmap.md`:
-
-- **v0.3 — Semantic temporality**: fact validity and supersedence chains ("was X, now Y" as one
-  evolving fact, not two memories), as-of queries, event-time anchoring.
+Next, per `docs/roadmap.md`: update versioning (in-place updates visible to as-of anchors),
+event-date-aware ranking, and richer temporal queries over the supersession graph.
 
 ## API
 
@@ -123,10 +138,25 @@ memory = Memory.from_config({
         "reinforcement_window": 3600,       # >=1 reinforcement/memory/hour, all triggers
         "reinforce_on_search": False,       # T3: opt-in, async, never blocks the hot path
     },
+    "temporality": {                        # v0.3: semantic temporality (all optional)
+        "enabled": True,                    # on by default
+        "superseded_penalty": 0.2,          # demotion for replaced facts (never exclusion)
+        "extract_event_date": True,         # optional event_date per extracted fact
+    },
 })
 
 memory.add("O deploy do auth_service_v3 é feito por canary de 5% durante 24h.", user_id="demo")
 memory.search("como fazemos deploy do serviço de autenticação?", user_id="demo", rerank=True)
+
+# v0.3: a later add that contradicts a stored fact supersedes it automatically
+# (detected by the extraction LLM); the old fact is demoted, never deleted.
+memory.add("Mudamos: o deploy do auth_service_v3 agora é blue-green, sem canary.", user_id="demo")
+
+# time travel: what did we know / what held on that date?
+memory.search("como fazemos deploy?", user_id="demo", as_of="2026-03-15")
+
+# audit trail of a memory (ADD / UPDATE / SUPERSEDED / DELETE)
+memory.history("<memory-id>")
 ```
 
 ## Evaluation harness

@@ -113,21 +113,39 @@ Writes happen only at **reinforcement triggers**:
 - Proof: temporal scenario in the harness — reinforced facts must outrank equally-similar
   unreinforced competitors, with no regression on the non-temporal baseline.
 
-## Phase 3 — Semantic temporality (v0.3)
+## Phase 3 — Semantic temporality (v0.3) — SHIPPED
 
 Where v0.2 makes the **usage** timeline govern ranking, v0.3 makes the **content** timeline a
-first-class dimension:
+first-class dimension.
 
-- **Fact validity & supersedence**: when a fact changes ("the embedder *was* X, is *now* Y"),
-  record an explicit supersedence chain (previous value, valid-from/valid-to) instead of two
-  unrelated memories. Foundation: the existing history table (ADD/UPDATE/DELETE per memory) plus
-  the v0.2 reinforcement hook, which already intercepts the exact dedup/update point.
-- **As-of queries**: "what did I know last March?" — search with a temporal anchor that filters
-  or re-scores candidates by validity interval.
-- **Event-time anchoring**: extract dates mentioned in the content so facts can be anchored to
-  when they *happened*, not when they were stored (upstream's `reference_date` is a paid-platform
-  stub — greenfield here, same as `decay`).
-- Non-goal: destructive rewrites. Superseded facts remain queryable as history.
+Measured on the supersedence scenario (`eval/eval_supersedence.py`, versioned fact pairs marked
+through the real production write path): the current fact outranks its superseded ancestor **3/3**
+on both ranking paths (fusion and reranked); the superseded fact stays reachable by its own
+phrasing **3/3** (demoted, never excluded); an `as_of` anchor between creation and supersession
+restores the old fact **3/3** (the replacement is cut by the record-time filter and the old fact
+carries no penalty at the anchor); and an untouched corpus ranks identically with temporality on
+or off.
+
+How it shipped:
+
+- **Supersession detected at extraction** — the same LLM call that already runs on every add
+  (its prompt already taught "Contradiction"/"Updated preference" for linking) now emits an
+  optional `supersedes: [<existing-memory-index>]`, resolved through the previously dead
+  `uuid_mapping` (hallucinated indices discarded). Explicit `update()` keeps its own chain in the
+  history log. Marking is deferred until the new fact is persisted, writes the full merged
+  payload, never re-marks (first marking wins → chains A→B→C emerge), and lands a `SUPERSEDED`
+  event in the history table (free-text event column — zero schema migration).
+- **Demotion, not deletion**: `superseded_penalty` (default 0.2 on the normalized score) applied
+  at fusion (`score_and_rank` gained a generic `penalties` dict) and after the reranker — in a
+  single sort combined with the ACT-R activation, so neither adjustment discards the other.
+- **`as_of` anchors**: record-time filter `created_at <= anchor` injected into the Qdrant filter
+  for both dense and keyword legs (auto-detected `DatetimeRange`; plain dates normalize to
+  end-of-day), plus anchor-aware penalty waiving. New `datetime` payload indexes on
+  `created_at`/`superseded_at` (created online on existing collections at startup).
+- **`event_date`** (optional, extraction-time): ISO date when the text clearly anchors *when* a
+  fact happened — event-time recorded and exposed; ranking use is future work.
+- Known limitation: in-place `update()` content is visible to earlier anchors (update versioning
+  is future work; the history table keeps the audit trail).
 
 ## Out of core (companion repo)
 
@@ -143,4 +161,6 @@ MCP server, LLM-based metadata classifier and observability emitters live in a c
   (6/6 reinforced-twin wins on both ranking paths; decisive-gap guard holds; fresh-corpus
   ON == OFF; write-back full-payload merge + windowed, failures never raise into the hot path).
 - **v0.3**: supersedence chain recorded on update; as-of search anchor working end-to-end;
-  superseded facts retrievable as history, never silently lost.
+  superseded facts retrievable as history, never silently lost. **DONE** (3/3 on all supersedence
+  scenario checks on both ranking paths; untouched corpus unchanged; marking write path
+  full-merge + first-marking-wins, failures never reach the hot path).
