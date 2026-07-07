@@ -66,6 +66,31 @@ class MemoryDynamicsConfig(BaseModel):
     )
 
 
+class MemoryTemporalityConfig(BaseModel):
+    """DeepMem0 v0.3: semantic temporality (fact supersession + as-of anchors).
+
+    Governs the CONTENT timeline (what replaced what, and when), independent
+    from MemoryDynamicsConfig which governs the USAGE timeline (ACT-R). A
+    superseded fact is never deleted or excluded — only demoted in ranking;
+    an ``as_of`` search anchor restores the world as it was on that date.
+    """
+
+    enabled: bool = Field(
+        description="Master switch: supersession marking on add, superseded ranking penalty and as_of anchors.",
+        default=True,
+    )
+    superseded_penalty: float = Field(
+        description="Subtracted from a superseded memory's FINAL normalized score ([0,1] scale),"
+        " both at fusion and after the reranker. Demotes, never excludes.",
+        default=0.2,
+    )
+    extract_event_date: bool = Field(
+        description="Ask the extraction LLM for an optional event_date (ISO date) per fact when"
+        " the text clearly anchors WHEN it happened. Never blocks the add.",
+        default=True,
+    )
+
+
 class MemoryConfig(BaseModel):
     vector_store: VectorStoreConfig = Field(
         description="Configuration for the vector store",
@@ -110,6 +135,10 @@ class MemoryConfig(BaseModel):
     dynamics: MemoryDynamicsConfig = Field(
         description="DeepMem0 v0.2: human-memory dynamics (ACT-R activation) settings.",
         default_factory=MemoryDynamicsConfig,
+    )
+    temporality: MemoryTemporalityConfig = Field(
+        description="DeepMem0 v0.3: semantic temporality (supersession + as-of) settings.",
+        default_factory=MemoryTemporalityConfig,
     )
 
 
