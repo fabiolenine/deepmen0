@@ -81,16 +81,19 @@ Honest notes:
 
 ## Status
 
-Pre-release. Roadmap (see `docs/roadmap.md`):
+**v0.1 shipped** — the fork carries the full mem0 v2.0.7 Python core with the multilingual
+retrieval baked in: `language` in `MemoryConfig` (wired through BM25, lemmatization and the
+extraction prompt), snake_case-safe BM25 indexing, fail-safe spaCy loading, reranker
+on-by-default with an over-fetched pool, and metadata-aware search filters. Validated in a
+self-hosted production deployment before release (numbers below).
 
-- **v0.1 — Portuguese first-class** (in progress): `language` in `MemoryConfig`, language-aware
-  BM25 + lemmatization (with fail-safe spaCy fallback), `use_input_language` extraction, multilingual
-  embedder/reranker defaults, reranker over-fetch, re-index migration tool.
+Next, per `docs/roadmap.md`:
+
 - **v0.2 — Human-memory dynamics**: ACT-R base-level activation as a ranking term, reinforcement
   write-back on re-encounter and (optionally, async) on access, configurable decay, non-destructive
   archiving.
 
-## Planned API (v0.1)
+## API (v0.1)
 
 ```python
 from mem0 import Memory
