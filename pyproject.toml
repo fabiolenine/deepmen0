@@ -9,10 +9,6 @@ description = "DeepMem0: memory for AI agents with first-class Portuguese and hu
 authors = [
     { name = "Alpha Quant AI" }
 ]
-
-[project.urls]
-Homepage = "https://github.com/fabiolenine/deepmen0"
-Repository = "https://github.com/fabiolenine/deepmen0"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
@@ -27,6 +23,10 @@ dependencies = [
     "sqlalchemy>=2.0.31",
     "protobuf>=5.29.6,<7.0.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/fabiolenine/deepmen0"
+Repository = "https://github.com/fabiolenine/deepmen0"
 
 [project.optional-dependencies]
 nlp = [
