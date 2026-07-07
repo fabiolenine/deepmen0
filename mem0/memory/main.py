@@ -126,14 +126,56 @@ _SENSITIVE_SUFFIXES = (
 ENTITY_PARAMS = frozenset({"user_id", "agent_id", "run_id"})
 
 
-def _reject_top_level_entity_params(kwargs: Dict[str, Any], method_name: str) -> None:
-    """Reject top-level entity parameters - must use filters instead."""
-    invalid_keys = ENTITY_PARAMS & set(kwargs.keys())
-    if invalid_keys:
-        raise ValueError(
-            f"Top-level entity parameters {invalid_keys} are not supported in {method_name}(). "
-            f"Use filters={{'user_id': '...'}} instead."
+def _extract_top_level_entity_params(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """DeepMem0: accept user_id/agent_id/run_id as top-level keyword sugar.
+
+    Upstream 2.0.x raised ValueError demanding filters={...}, breaking every
+    pre-2.0 caller for no gain. The scalars are folded into filters instead
+    (an explicit filters dict wins on conflict).
+    """
+    return {k: kwargs.pop(k) for k in ENTITY_PARAMS if k in kwargs}
+
+
+def _apply_metadata_post_filters(
+    memories,
+    *,
+    min_importance: Optional[float] = None,
+    domain: Optional[str] = None,
+    memory_type: Optional[str] = None,
+    sort_by_importance: bool = False,
+):
+    """DeepMem0: post-hoc filtering/ordering over classified metadata.
+
+    Operates on the metadata dict of each result (keys such as importance,
+    domain and memory_type, typically written by an application-level
+    classifier). Memories without the key are excluded by that filter.
+    """
+    if not memories:
+        return memories
+    if min_importance is None and not domain and not memory_type and not sort_by_importance:
+        return memories
+
+    def _meta(m):
+        return (m.get("metadata") or {}) if isinstance(m, dict) else {}
+
+    out = memories
+    if min_importance is not None:
+        out = [
+            m for m in out
+            if isinstance(_meta(m).get("importance"), (int, float))
+            and _meta(m)["importance"] >= min_importance
+        ]
+    if domain:
+        out = [m for m in out if _meta(m).get("domain") == domain]
+    if memory_type:
+        out = [m for m in out if _meta(m).get("memory_type") == memory_type]
+    if sort_by_importance:
+        out = sorted(
+            out,
+            key=lambda m: _meta(m).get("importance") or 0.0,
+            reverse=True,
         )
+    return out
 
 
 def _validate_and_trim_entity_id(value: Optional[str], name: str) -> Optional[str]:
@@ -1162,7 +1204,9 @@ class Memory(MemoryBase):
                 or if top_k is invalid.
         """
         # Reject top-level entity params - must use filters instead
-        _reject_top_level_entity_params(kwargs, "get_all")
+        _scope_kwargs = _extract_top_level_entity_params(kwargs)
+        if _scope_kwargs:
+            filters = {**_scope_kwargs, **(filters or {})}
 
         # Validate top_k
         _validate_search_params(top_k=top_k)
@@ -1262,6 +1306,10 @@ class Memory(MemoryBase):
         rerank: Optional[bool] = None,
         explain: bool = False,
         reference_date: Optional[Any] = None,
+        min_importance: Optional[float] = None,
+        domain: Optional[str] = None,
+        memory_type: Optional[str] = None,
+        sort_by_importance: bool = False,
         **kwargs,
     ):
         """
@@ -1307,7 +1355,9 @@ class Memory(MemoryBase):
             raise ValueError(get_temporal_feature_error_message("sync", "search", "reference_date"))
 
         # Reject top-level entity params - must use filters instead
-        _reject_top_level_entity_params(kwargs, "search")
+        _scope_kwargs = _extract_top_level_entity_params(kwargs)
+        if _scope_kwargs:
+            filters = {**_scope_kwargs, **(filters or {})}
 
         # Validate search parameters (before applying defaults)
         _validate_search_params(threshold=threshold, top_k=top_k)
@@ -1389,6 +1439,13 @@ class Memory(MemoryBase):
                 logger.warning(f"Reranking failed, using original results: {e}")
         # DeepMem0: cut the over-fetched pool back to the requested top_k.
         original_memories = original_memories[:limit]
+        original_memories = _apply_metadata_post_filters(
+            original_memories,
+            min_importance=min_importance,
+            domain=domain,
+            memory_type=memory_type,
+            sort_by_importance=sort_by_importance,
+        )
 
         if temporal_usage_notice:
             display_temporal_usage_notice(self, "sync", "search", *temporal_usage_notice)
@@ -2725,7 +2782,9 @@ class AsyncMemory(MemoryBase):
                 or if top_k is invalid.
         """
         # Reject top-level entity params - must use filters instead
-        _reject_top_level_entity_params(kwargs, "get_all")
+        _scope_kwargs = _extract_top_level_entity_params(kwargs)
+        if _scope_kwargs:
+            filters = {**_scope_kwargs, **(filters or {})}
 
         # Validate top_k
         _validate_search_params(top_k=top_k)
@@ -2825,6 +2884,10 @@ class AsyncMemory(MemoryBase):
         rerank: Optional[bool] = None,
         explain: bool = False,
         reference_date: Optional[Any] = None,
+        min_importance: Optional[float] = None,
+        domain: Optional[str] = None,
+        memory_type: Optional[str] = None,
+        sort_by_importance: bool = False,
         **kwargs,
     ):
         """
@@ -2872,7 +2935,9 @@ class AsyncMemory(MemoryBase):
             )
 
         # Reject top-level entity params - must use filters instead
-        _reject_top_level_entity_params(kwargs, "search")
+        _scope_kwargs = _extract_top_level_entity_params(kwargs)
+        if _scope_kwargs:
+            filters = {**_scope_kwargs, **(filters or {})}
 
         # Validate search parameters (before applying defaults)
         _validate_search_params(threshold=threshold, top_k=top_k)
@@ -2959,6 +3024,13 @@ class AsyncMemory(MemoryBase):
                 logger.warning(f"Reranking failed, using original results: {e}")
         # DeepMem0: cut the over-fetched pool back to the requested top_k.
         original_memories = original_memories[:limit]
+        original_memories = _apply_metadata_post_filters(
+            original_memories,
+            min_importance=min_importance,
+            domain=domain,
+            memory_type=memory_type,
+            sort_by_importance=sort_by_importance,
+        )
 
         if temporal_usage_notice:
             await display_temporal_usage_notice_async(self, "async", "search", *temporal_usage_notice)
