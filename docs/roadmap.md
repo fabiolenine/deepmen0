@@ -181,6 +181,21 @@ by it while the fresh fact stayed unmarked.
 MCP server, LLM-based metadata classifier and observability emitters live in a companion project
 (they bind to specific local infra); the fork core stays a clean library.
 
+**Multimodal ingestion (documents + images)** also ships in the companion project — it is
+poppler-/VLM-bound serving glue, not library concerns:
+- **Documents (PDF)** — a durable async queue turns an `add_document(path)` into per-page text
+  extraction (poppler), page-aware chunking, and per-chunk fact extraction with document/page
+  provenance; conversation adds interleave between chunks. *Shipped in the companion.*
+- **Images + scanned PDFs** — scanned pages (`pdftoppm` → image) and standalone images are
+  transcribed by a local vision model, then flow through the same chunk → extract path;
+  production-validated end-to-end (a page whose text existed only as pixels was transcribed with
+  accents restored and made searchable). *Shipped in the companion.*
+
+Two reusable pieces are candidates for absorption into this core as **0.5.0** (kept dependency-free
+for exactly this): the page-aware chunker, and an Ollama-provider fix so `image_url` message blocks
+reach Ollama as its `images` field (today the core's vision path assumes an OpenAI-style API) plus
+an optional `vision_model` on `OllamaConfig`.
+
 ## Definition of Done
 
 - **v0.1**: `language="pt"` end-to-end; PT gains measured and versioned on the synthetic corpus;
