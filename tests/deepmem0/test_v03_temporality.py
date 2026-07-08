@@ -238,7 +238,7 @@ class TestMarkSuperseded:
         store = FakeVectorStore({"old-1": {"data": "v1", "created_at": iso_days_ago(30), "domain": "infra"}})
         db = FakeDB()
         marked = _mark_superseded(store, db, "new-1", "v2", ["old-1"])
-        assert marked == ["old-1"]
+        assert marked == [("old-1", "new-1")]
         _, payload = store.updates[0]
         assert payload["superseded_by"] == "new-1"
         assert "superseded_at" in payload
