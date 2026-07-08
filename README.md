@@ -187,6 +187,16 @@ python eval/eval_retrieval.py audit
 python eval/eval_retrieval.py run --label my_run --mcp http://localhost:8081/mcp
 ```
 
+## Use it as a Claude skill (memory that fills itself)
+
+`skill/deepmem0-memory.skill` is a Claude Skill that makes Claude use these memory
+tools *proactively and selectively* — pulling context at the start of a technical
+chat and saving only durable facts, under a strict save/discard filter. In Claude
+Code its own trigger is enough; in Claude Desktop (chat), pair it with a short
+always-on custom instruction so it fires every relevant turn — progressive
+disclosure: the instruction fires, the skill supplies the *how*. Setup and the
+copy-paste rubric live in [`skill/README.md`](skill/README.md).
+
 ## Relationship to upstream
 
 Deep Mem0 tracks Mem0 v2.0.7 as its base and stays intentionally close to upstream design
@@ -225,5 +235,12 @@ código aberto, algo que no upstream existe só na plataforma paga.
 Roadmap: **v0.1** português de primeira classe; **v0.2** dinâmica de memória humana (ACT-R);
 **v0.3** temporalidade semântica (validade e supersedência de fatos, consultas as-of).
 Detalhes em `docs/roadmap.md`. Licença Apache-2.0; atribuição ao Mem0 em `NOTICE`.
+
+**Usar como skill do Claude:** `skill/deepmem0-memory.skill` faz o Claude usar essas
+ferramentas de memória de forma proativa e seletiva — recupera contexto no início de
+uma conversa técnica e salva só o que é durável, com filtro rigoroso. No Claude Code o
+gatilho da própria skill basta; no Claude Desktop (chat), combine-a com uma instrução
+curta sempre-ativa (progressive disclosure: a instrução dispara, a skill fornece o
+*como*). Setup e a rubrica para copiar estão em [`skill/README.md`](skill/README.md).
 
 Um projeto open-source da **Alpha Quant AI**.
