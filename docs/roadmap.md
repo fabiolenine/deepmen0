@@ -152,6 +152,30 @@ How it shipped:
 - Known limitation: in-place `update()` content is visible to earlier anchors (update versioning
   is future work; the history table keeps the audit trail).
 
+## Phase 4 — Ingest-time decoupling (v0.4) — SHIPPED
+
+Asynchronous ingestion (a queue between the API ack and the extraction pipeline) separates
+*submission time* from *processing time*. The queue and worker live in the companion repo (they
+bind to specific serving infra); the core ships the two record-time contracts that make any such
+queue safe:
+
+- **Caller-supplied `created_at` is canonical** — `metadata["created_at"]` survives both the
+  inference and raw add paths (it was already the guard condition; now it is a locked, tested
+  contract). A worker stamps the enqueue time and `as_of` anchors, history and supersession all
+  ignore the queue delay. Arbitrary extra metadata (e.g. a `task_id` for provenance and
+  crash-cleanup) flows into the payload untouched.
+- **Born-superseded arbitration** — supersession marking compares record times: when the arriving
+  fact's `created_at` predates the existing memory's, the direction inverts and the newcomer is
+  persisted already marked `superseded_by` the fresher fact. An out-of-order arrival (a queued
+  item overtaken by a direct write) can never demote newer truth. Forward marking,
+  first-marking-wins and the `SUPERSEDED` history event are unchanged; mixed timestamps build
+  chains in a single pass. Missing/unparsable timestamps keep the pre-queue behavior.
+
+Proof: `tests/deepmem0/test_v04_ingest_time.py` (direction arbitration incl. chain construction,
+created_at contract) plus a live smoke on the production deployment — a job with its submission
+time forced two days into the past, conflicting with a fresher stored fact, was born superseded
+by it while the fresh fact stayed unmarked.
+
 ## Out of core (companion repo)
 
 MCP server, LLM-based metadata classifier and observability emitters live in a companion project
@@ -169,3 +193,7 @@ MCP server, LLM-based metadata classifier and observability emitters live in a c
   superseded facts retrievable as history, never silently lost. **DONE** (3/3 on all supersedence
   scenario checks on both ranking paths; untouched corpus unchanged; marking write path
   full-merge + first-marking-wins, failures never reach the hot path).
+- **v0.4**: caller-supplied record time honored end-to-end; supersession direction arbitrated by
+  record time so late arrivals never demote fresher facts. **DONE** (unit-locked contracts +
+  live smoke: a two-days-stale queued fact conflicting with a fresh stored fact was born
+  superseded by it, chain and history intact).

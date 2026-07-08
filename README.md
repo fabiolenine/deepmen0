@@ -55,6 +55,7 @@ patches) and are being baked into this fork as first-class code.
 | Hybrid fusion | Candidate set built **from the dense retriever only**; BM25 can boost but never introduce a candidate | Mitigated today by over-fetch + rerank; true candidate union on the roadmap |
 | Frequency / recency (human memory) | **Paid platform only** — `decay` and `reference_date` raise errors in OSS | ACT-R base-level activation as a ranking signal, reinforcement timeline per memory, open source *(v0.2, shipped)* |
 | Fact evolution over time | Updated facts overwrite in place or coexist as unrelated near-duplicates; `reference_date` is a paid stub | Supersession chains detected at extraction ("was X, now Y" links old → new), superseded facts demoted-never-deleted, `as_of` time-travel search, optional `event_date` per fact *(v0.3, shipped)* |
+| Deferred / queued ingestion | `add()` blocks the caller for the full LLM extraction; processing time silently becomes the fact's record time | Record-time contracts for async pipelines: a caller-supplied `created_at` (the submission time) is honored end-to-end, and supersession direction arbitrates by record time — a queued fact that lost the race to a fresher write is **born superseded**, never demoting newer truth *(v0.4, shipped)* |
 | Search-time metadata filters | Scope and payload filters | Plus `min_importance`, `domain`, `memory_type`, `sort_by_importance` *(v0.1)* |
 | Ops tooling | — | Re-index migration (embedder/language cutover), BM25 backfill, eval harness + synthetic PT/EN corpus |
 
@@ -82,7 +83,19 @@ Honest notes:
 
 ## Status
 
-**v0.3 shipped** — semantic temporality is live. Facts now live on a *content* timeline: when a
+**v0.4 shipped** — ingest-time decoupling. Queueing an add separates *when a fact was said* from
+*when the pipeline processed it*, and the core now keeps those honest: `metadata["created_at"]`
+supplied by the caller (canonically the submission time) is preserved through both the inference
+and raw paths — `as_of` anchors and history keep working across queue delays — and supersession
+marking arbitrates by record time: when the extraction LLM links an arriving fact to an existing
+one whose `created_at` is *newer*, the direction inverts and the newcomer lands already marked
+`superseded_by` the fresher fact (born superseded), so an out-of-order arrival can never demote
+newer truth. Forward marking, first-marking-wins immutability and the SUPERSEDED history event are
+unchanged; mixed timestamps build the chain in a single pass. This is the core half of an
+asynchronous ingestion pipeline — the queue/worker themselves belong to whatever serves the API
+(an MCP server, a job runner), which only needs to stamp `created_at` at enqueue time.
+
+**v0.3** — semantic temporality is live. Facts now live on a *content* timeline: when a
 new fact **replaces** an old one ("Atlas used MySQL" → "Atlas uses PostgreSQL"), the extraction
 LLM — in the same call that already runs on every add — marks the supersession; the old memory
 gains `superseded_by`/`superseded_at`, the new one records `supersedes`, and the chain lands in
