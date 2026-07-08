@@ -112,6 +112,27 @@ def parse_as_of(value: Any) -> Tuple[str, datetime]:
     return dt.isoformat(), dt
 
 
+def supersession_inverted(new_created_at: Any, old_created_at: Any) -> bool:
+    """Whether an arriving fact should be born-superseded by an existing one.
+
+    Asynchronous ingestion decouples submission time from processing time: a
+    fact can reach the store AFTER a newer fact about the same subject was
+    already persisted (a queued item overtaken by a direct write). The default
+    marking direction — "what arrives supersedes what exists" — assumes
+    arrival order equals truth order, which a queue breaks. When the arriving
+    memory's record time (``created_at``, canonically its submission time)
+    strictly predates the existing memory's, the direction inverts: the
+    newcomer is born superseded and the existing fact stays current. A
+    missing or unparsable timestamp on either side keeps the forward
+    direction (the pre-queue behavior).
+    """
+    new_dt = _parse_ts(new_created_at)
+    old_dt = _parse_ts(old_created_at)
+    if new_dt is None or old_dt is None:
+        return False
+    return new_dt < old_dt
+
+
 def superseded_penalty_applies(payload: Dict[str, Any], as_of: Optional[datetime] = None) -> bool:
     """Whether a memory should carry the superseded ranking penalty.
 

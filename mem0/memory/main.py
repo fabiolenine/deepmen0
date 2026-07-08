@@ -12,7 +12,7 @@ import uuid
 import warnings
 from copy import deepcopy
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from pydantic import ValidationError
 
@@ -88,6 +88,7 @@ from mem0.utils.temporality import (
     parse_event_date,
     parse_supersedes_ids,
     superseded_penalty_applies,
+    supersession_inverted,
 )
 from mem0.vector_stores.base import VectorStoreBase
 
@@ -442,19 +443,29 @@ def _temporality_config(config) -> Optional[Any]:
     return temp if temp is not None and getattr(temp, "enabled", False) else None
 
 
-def _mark_superseded(vector_store, db, new_id, new_text, old_ids) -> List[str]:
-    """DeepMem0 v0.3: mark old memories as superseded by a newly added fact.
+def _mark_superseded(vector_store, db, new_id, new_text, old_ids, new_created_at=None) -> List[Tuple[str, str]]:
+    """DeepMem0 v0.3/v0.4: mark supersessions between a new fact and the
+    memories the LLM says it replaces.
 
-    Non-destructive: the old memory keeps living in the store (search demotes
-    it, an as_of anchor can restore it) and gains ``superseded_by`` +
+    Non-destructive: a superseded memory keeps living in the store (search
+    demotes it, an as_of anchor can restore it) and gains ``superseded_by`` +
     ``superseded_at``. The first marking wins — an already-superseded memory
     is never re-marked, so ``superseded_at`` stays immutable and chains
     A -> B -> C emerge naturally. Every marking is recorded in the history DB
     as a SUPERSEDED event. Full-payload merge; never raises — supersession is
     bookkeeping and must not break the add.
+
+    v0.4 (async ingestion): the marking direction honors record time. When
+    ``new_created_at`` (canonically the fact's submission time) predates an
+    existing memory's ``created_at``, the NEW memory is born superseded by
+    the existing one instead — a queued fact that lost the race to a direct
+    write must never demote fresher truth (see ``supersession_inverted``).
+
+    Returns the ``(superseded_id, superseding_id)`` pairs actually marked.
     """
     now_iso = _dynamics_utcnow().isoformat()
-    marked: List[str] = []
+    marked: List[Tuple[str, str]] = []
+    new_settled = False  # first marking wins for the born-superseded new memory too
     for old_id in old_ids or []:
         try:
             if old_id == new_id:
@@ -462,6 +473,33 @@ def _mark_superseded(vector_store, db, new_id, new_text, old_ids) -> List[str]:
             mem = vector_store.get(vector_id=old_id)
             payload = getattr(mem, "payload", None) if mem is not None else None
             if payload is None:
+                continue
+            if supersession_inverted(new_created_at, payload.get("created_at")):
+                if new_settled:
+                    continue
+                new_settled = True
+                new_mem = vector_store.get(vector_id=new_id)
+                new_payload = getattr(new_mem, "payload", None) if new_mem is not None else None
+                if new_payload is None or new_payload.get(FIELD_SUPERSEDED_BY):
+                    continue
+                vector_store.update(
+                    vector_id=new_id,
+                    payload={**new_payload, FIELD_SUPERSEDED_BY: old_id, FIELD_SUPERSEDED_AT: now_iso},
+                )
+                try:
+                    db.add_history(
+                        new_id,
+                        new_payload.get("data"),
+                        payload.get("data"),
+                        "SUPERSEDED",
+                        created_at=new_payload.get("created_at"),
+                        updated_at=now_iso,
+                        actor_id=new_payload.get("actor_id"),
+                        role=new_payload.get("role"),
+                    )
+                except Exception as e:
+                    logger.warning(f"Supersession history record failed for {new_id}: {e}")
+                marked.append((new_id, old_id))
                 continue
             if payload.get(FIELD_SUPERSEDED_BY):
                 continue
@@ -482,7 +520,7 @@ def _mark_superseded(vector_store, db, new_id, new_text, old_ids) -> List[str]:
                 )
             except Exception as e:
                 logger.warning(f"Supersession history record failed for {old_id}: {e}")
-            marked.append(old_id)
+            marked.append((old_id, new_id))
         except Exception as e:
             logger.warning(f"Supersession marking failed for {old_id}: {e}")
     return marked
@@ -1122,7 +1160,7 @@ class Memory(MemoryBase):
 
         dyn = _dynamics_config(self.config)
         records = []  # (memory_id, text, embedding, payload)
-        pending_supersessions = []  # (new_memory_id, new_text, [old_ids]) — applied after persist
+        pending_supersessions = []  # (new_memory_id, new_text, [old_ids], new_created_at) — applied after persist
         seen_hashes = set()  # dedup within the current batch
         for mem in extracted_memories:
             text = mem.get("text")
@@ -1163,7 +1201,7 @@ class Memory(MemoryBase):
                 supersedes_ids = parse_supersedes_ids(mem.get("supersedes"), uuid_mapping)
                 if supersedes_ids:
                     mem_metadata[FIELD_SUPERSEDES] = supersedes_ids
-                    pending_supersessions.append((memory_id, text, supersedes_ids))
+                    pending_supersessions.append((memory_id, text, supersedes_ids, mem_metadata["created_at"]))
                 if temp.extract_event_date:
                     event_date = parse_event_date(mem.get("event_date"))
                     if event_date:
@@ -1199,9 +1237,12 @@ class Memory(MemoryBase):
         superseded_events = []
         if pending_supersessions:
             try:
-                for new_id, new_text, old_ids in pending_supersessions:
-                    for old_id in _mark_superseded(self.vector_store, self.db, new_id, new_text, old_ids):
-                        superseded_events.append((old_id, new_id))
+                for new_id, new_text, old_ids, new_created in pending_supersessions:
+                    superseded_events.extend(
+                        _mark_superseded(
+                            self.vector_store, self.db, new_id, new_text, old_ids, new_created_at=new_created
+                        )
+                    )
             except Exception as e:
                 logger.warning(f"Supersession marking pass failed: {e}")
 
@@ -1338,9 +1379,11 @@ class Memory(MemoryBase):
             for r in records
         ]
         # DeepMem0 v0.3: surface supersessions to the caller (additive entries).
+        # v0.4: pairs may point either way — a queued fact that arrived late is
+        # born superseded by the fresher existing one (superseded_id == new id).
         returned_memories.extend(
-            {"id": old_id, "event": "SUPERSEDED", "superseded_by": new_id}
-            for old_id, new_id in superseded_events
+            {"id": superseded_id, "event": "SUPERSEDED", "superseded_by": superseding_id}
+            for superseded_id, superseding_id in superseded_events
         )
 
         keys, encoded_ids = process_telemetry_filters(filters)
@@ -2825,7 +2868,7 @@ class AsyncMemory(MemoryBase):
 
         dyn = _dynamics_config(self.config)
         records = []
-        pending_supersessions = []  # (new_memory_id, new_text, [old_ids]) — applied after persist
+        pending_supersessions = []  # (new_memory_id, new_text, [old_ids], new_created_at) — applied after persist
         seen_hashes = set()
         for mem in extracted_memories:
             text = mem.get("text")
@@ -2863,7 +2906,7 @@ class AsyncMemory(MemoryBase):
                 supersedes_ids = parse_supersedes_ids(mem.get("supersedes"), uuid_mapping)
                 if supersedes_ids:
                     mem_metadata[FIELD_SUPERSEDES] = supersedes_ids
-                    pending_supersessions.append((memory_id, text, supersedes_ids))
+                    pending_supersessions.append((memory_id, text, supersedes_ids, mem_metadata["created_at"]))
                 if temp.extract_event_date:
                     event_date = parse_event_date(mem.get("event_date"))
                     if event_date:
@@ -2898,11 +2941,12 @@ class AsyncMemory(MemoryBase):
         superseded_events = []
         if pending_supersessions:
             try:
-                for new_id, new_text, old_ids in pending_supersessions:
+                for new_id, new_text, old_ids, new_created in pending_supersessions:
                     marked = await asyncio.to_thread(
-                        _mark_superseded, self.vector_store, self.db, new_id, new_text, old_ids
+                        _mark_superseded, self.vector_store, self.db, new_id, new_text, old_ids,
+                        new_created_at=new_created,
                     )
-                    superseded_events.extend((old_id, new_id) for old_id in marked)
+                    superseded_events.extend(marked)
             except Exception as e:
                 logger.warning(f"Supersession marking pass failed (async): {e}")
 
@@ -3039,9 +3083,11 @@ class AsyncMemory(MemoryBase):
             for r in records
         ]
         # DeepMem0 v0.3: surface supersessions to the caller (additive entries).
+        # v0.4: pairs may point either way — a queued fact that arrived late is
+        # born superseded by the fresher existing one (superseded_id == new id).
         returned_memories.extend(
-            {"id": old_id, "event": "SUPERSEDED", "superseded_by": new_id}
-            for old_id, new_id in superseded_events
+            {"id": superseded_id, "event": "SUPERSEDED", "superseded_by": superseding_id}
+            for superseded_id, superseding_id in superseded_events
         )
 
         keys, encoded_ids = process_telemetry_filters(effective_filters)
