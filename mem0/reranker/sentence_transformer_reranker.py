@@ -38,10 +38,17 @@ class SentenceTransformerReranker(BaseReranker):
                 device=None,  # Will auto-detect
                 batch_size=32,  # Default
                 show_progress_bar=False,  # Default
+                max_length=getattr(config, 'max_length', None),
             )
 
         self.config = config
-        self.model = CrossEncoder(self.config.model, device=self.config.device)
+        # max_length=None lets sentence-transformers fall back to the model default;
+        # a lower cap truncates each pair, cutting CPU cross-encoder latency on long docs.
+        self.model = CrossEncoder(
+            self.config.model,
+            device=self.config.device,
+            max_length=getattr(self.config, "max_length", None),
+        )
         
     def rerank(self, query: str, documents: List[Dict[str, Any]], top_k: int = None) -> List[Dict[str, Any]]:
         """

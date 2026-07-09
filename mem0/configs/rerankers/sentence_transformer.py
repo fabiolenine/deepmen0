@@ -14,3 +14,4 @@ class SentenceTransformerRerankerConfig(BaseRerankerConfig):
     device: Optional[str] = Field(default=None, description="Device to run the model on ('cpu', 'cuda', etc.)")
     batch_size: int = Field(default=32, description="Batch size for processing documents")
     show_progress_bar: bool = Field(default=False, description="Whether to show progress bar during processing")
+    max_length: Optional[int] = Field(default=None, description="Max tokens per query-document pair fed to the cross-encoder; None uses the model default. A lower cap (e.g. 256) sharply cuts CPU rerank latency on long documents with little ranking-quality loss.")
