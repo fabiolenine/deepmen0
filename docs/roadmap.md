@@ -150,7 +150,10 @@ How it shipped:
 - **`event_date`** (optional, extraction-time): ISO date when the text clearly anchors *when* a
   fact happened — event-time recorded and exposed; ranking use is future work.
 - Known limitation: in-place `update()` content is visible to earlier anchors (update versioning
-  is future work; the history table keeps the audit trail).
+  is future work; the history table keeps the audit trail). The leak is reproduced
+  deterministically by `eval/eval_update_versioning.py` — the executable acceptance criterion
+  for the future work: it XFAILs today by design (ternary verdict: known leak / true fix /
+  unexpected), and `--expect-fixed` turns it into the hard gate once versioning ships.
 
 ## Phase 4 — Ingest-time decoupling (v0.4) — SHIPPED
 
