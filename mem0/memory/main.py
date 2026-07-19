@@ -1416,6 +1416,7 @@ class Memory(MemoryBase):
             "run_id",
             "actor_id",
             "role",
+            "memory_scope",
         ]
 
         core_and_promoted_keys = {"data", "hash", "created_at", "updated_at", "id", "text_lemmatized", "attributed_to", *promoted_payload_keys}
@@ -1531,6 +1532,7 @@ class Memory(MemoryBase):
             "run_id",
             "actor_id",
             "role",
+            "memory_scope",
         ]
         core_and_promoted_keys = {"data", "hash", "created_at", "updated_at", "id", "text_lemmatized", "attributed_to", *promoted_payload_keys}
 
@@ -1963,6 +1965,7 @@ class Memory(MemoryBase):
             "run_id",
             "actor_id",
             "role",
+            "memory_scope",
         ]
         core_and_promoted_keys = {"data", "hash", "created_at", "updated_at", "id", "text_lemmatized", "attributed_to", *promoted_payload_keys}
 
@@ -3120,6 +3123,7 @@ class AsyncMemory(MemoryBase):
             "run_id",
             "actor_id",
             "role",
+            "memory_scope",
         ]
 
         core_and_promoted_keys = {"data", "hash", "created_at", "updated_at", "id", "text_lemmatized", "attributed_to", *promoted_payload_keys}
@@ -3235,6 +3239,7 @@ class AsyncMemory(MemoryBase):
             "run_id",
             "actor_id",
             "role",
+            "memory_scope",
         ]
         core_and_promoted_keys = {"data", "hash", "created_at", "updated_at", "id", "text_lemmatized", "attributed_to", *promoted_payload_keys}
 
@@ -3666,6 +3671,7 @@ class AsyncMemory(MemoryBase):
             "run_id",
             "actor_id",
             "role",
+            "memory_scope",
         ]
         core_and_promoted_keys = {"data", "hash", "created_at", "updated_at", "id", "text_lemmatized", "attributed_to", *promoted_payload_keys}
 
