@@ -915,6 +915,25 @@ Before producing output, mentally scan the ENTIRE conversation — every single 
 A common failure mode is "first topic dominance" — the extractor captures the first major topic thoroughly, then treats subsequent topics as filler. This is WRONG. Every topic mentioned deserves extraction if it contains memorable facts. If a chunk has 8 messages covering 4 different topics, you MUST produce memories for all 4 topics — not just the first or most prominent one.
 
 
+## Example 13: Non-English Input — Output Language Follows the INPUT
+
+Every other example in this prompt is in English, which is exactly why this one
+exists: without it, the examples themselves are the strongest signal in the
+prompt about what language to write in, and they are all wrong for a
+non-English corpus. Note the alphabet here is the same as English — that is not
+evidence of anything.
+
+Existing Memories: []
+New Messages:
+[{"role": "user", "content": "Prefiro que as respostas sejam técnicas e diretas, sem enrolação. E o banco principal da aplicação é PostgreSQL 16."}]
+Observation Date: 2026-07-21
+
+Output: {"memory": [
+  {"id": "0", "text": "O usuário prefere respostas técnicas e diretas, sem enrolação", "attributed_to": "user"},
+  {"id": "1", "text": "O banco de dados principal da aplicação do usuário é PostgreSQL 16", "attributed_to": "user"}
+]}
+
+
 # OUTPUT FORMAT
 
 Return ONLY valid JSON parsable by json.loads(). No text, reasoning, explanations, or wrappers.
@@ -1103,17 +1122,38 @@ def generate_additive_extraction_prompt(
         sections.append(f"## Custom Instructions\n{custom_instructions}")
 
     if use_input_language:
+        # Why this block is worded the way it is (measured 2026-07-21).
+        #
+        # The previous version anchored almost entirely on NON-LATIN scripts:
+        # 5 of its 8 points talked about Korean, Japanese, CJK, Hinglish or
+        # "preserve the exact script/alphabet". For a Latin-script language
+        # that guidance is VACUOUS — Portuguese and English share the alphabet,
+        # so "preserve the script" licenses nothing. The only point that bit
+        # was "do not translate", buried among CJK-flavoured ones, competing
+        # against 15k characters of English few-shot examples.
+        #
+        # Result in production, with use_input_language ALREADY True
+        # (language="pt"): extraction drifted to English whenever the scope had
+        # no Portuguese memories to pull it back. Dose curve on a Portuguese
+        # input: 0 seeds -> English, 1 seed -> English, 6 seeds -> Portuguese.
+        # 10.5% of a real 693-memory corpus had been written in English.
+        #
+        # So the fix is not "more emphasis": it is naming the two false signals
+        # the model was actually following — the examples' language, and the
+        # shared alphabet — and denying both explicitly.
         sections.append(
             "## Language Requirement\n"
             "CRITICAL: Respond in the SAME LANGUAGE and SCRIPT as the input messages.\n"
-            "1. Match the language of the user's messages exactly — if they write in Korean, extract in Korean; Japanese in Japanese; etc.\n"
-            "2. Preserve the exact script/alphabet of the input.\n"
-            "3. Do NOT translate or transliterate into English unless the input is already in English.\n"
-            "4. Maintain all quality standards (contextual richness, temporal grounding, etc.) regardless of language.\n"
-            "5. Technical terms, proper nouns, and brand names should be preserved in their original form as used in the input.\n"
-            "6. If the input mixes languages (e.g., Hinglish), preserve both the mixed language style AND the script.\n"
-            "7. For Japanese: explicitly resolve omitted subjects using conversation context.\n"
-            "8. For CJK languages: maintain appropriate formality level from the source text."
+            "1. Match the language of the user's messages exactly — if they write in Portuguese, extract in Portuguese; Korean in Korean; Japanese in Japanese; etc.\n"
+            "2. The EXAMPLES in the system prompt are written in English only because the prompt itself is. They are NOT evidence about the output language and do NOT license translating the input. Ignore their language entirely.\n"
+            "3. Sharing an alphabet with English is NOT evidence that the input is English. For Latin-script languages (Portuguese, Spanish, French, Italian, German, ...) the language of the message decides — never the script, never the examples.\n"
+            "4. Do NOT translate or transliterate into English unless the input is already in English.\n"
+            "5. Preserve the exact script/alphabet of the input.\n"
+            "6. Maintain all quality standards (contextual richness, temporal grounding, etc.) regardless of language.\n"
+            "7. Technical terms, proper nouns, and brand names should be preserved in their original form as used in the input.\n"
+            "8. If the input mixes languages (e.g., Hinglish), preserve both the mixed language style AND the script.\n"
+            "9. For Japanese: explicitly resolve omitted subjects using conversation context.\n"
+            "10. For CJK languages: maintain appropriate formality level from the source text."
         )
 
     sections.append("# Output:")
