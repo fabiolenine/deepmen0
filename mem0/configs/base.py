@@ -44,9 +44,21 @@ class MemoryDynamicsConfig(BaseModel):
         default=0.5,
     )
     weight: float = Field(
-        description="Weight of the activation boost in ranking, both at fusion and after the"
-        " reranker. 0 disables the ranking term (write-back still records the timeline).",
+        description="Weight of the activation boost at the FUSION stage (pre-rerank pool"
+        " shaping). 0 disables the ranking term (write-back still records the timeline)."
+        " Post-rerank, activation is a bounded TIE-BREAKER (see tie_band), never an"
+        " additive term — the additive form overturned decisive reranker gaps"
+        " (measured 2026-07-21: at 0.15 it flipped a 0.15-logit reranker preference).",
         default=0.15,
+    )
+    tie_band: float = Field(
+        description="Post-rerank near-tie width in SIGMOID(logit) space. Activation only"
+        " reorders candidates whose relevance scores fall within this band of each other"
+        " (a genuine reranker tie); outside it, the reranker's order is preserved. Calibrated"
+        " 2026-07-21 from the golden: real near-ties ~0.0002 vs decisive gaps ~0.038 (a 190x"
+        " separation), so 0.002 breaks ties without overturning decisions. Reranker-dependent:"
+        " re-calibrate if the cross-encoder changes. 0 = pure reranker order (no tie-break).",
+        default=0.002,
     )
     reinforcement_window: int = Field(
         description="Seconds after a reinforcement during which further re-encounters of the"

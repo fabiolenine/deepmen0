@@ -566,24 +566,31 @@ def _reinforce_hits_in_background(vector_store, dyn, memory_ids) -> None:
 
 def _apply_post_rerank_adjustments(memories, dyn=None, temp=None, as_of=None) -> List[Dict[str, Any]]:
     """Blend ACT-R activation (v0.2) and the superseded penalty (v0.3) into the
-    reranked order — in a SINGLE sort, so one adjustment never discards the other.
+    reranked order.
 
-    The cross-encoder emits unbounded logits; they are squashed with a sigmoid
-    to (0, 1). Activation is added at ``dyn.weight`` — enough to break
-    near-ties between equally-similar candidates, not to overturn a decisive
-    relevance gap. The superseded penalty is subtracted at
-    ``temp.superseded_penalty`` — deliberately strong enough that a superseded
-    fact loses to its current replacement even when slightly more similar;
-    with an ``as_of`` anchor the penalty is waived for memories superseded
-    only after the anchor. Memories without dynamics/temporality fields keep
-    their reranked order.
+    RELEVANCE is the sigmoid of the cross-encoder logit; the superseded penalty
+    (v0.3) is subtracted from it — deliberately strong enough that a superseded
+    fact loses to its current replacement even when slightly more similar, waived
+    for memories superseded only after an ``as_of`` anchor.
+
+    ACT-R activation (v0.2) is a BOUNDED TIE-BREAKER, not an additive term.
+    Measured 2026-07-21: the additive form (``base + weight*activation``)
+    overturned DECISIVE reranker gaps because the sigmoid compresses small logits
+    into a narrow band around 0.5 — a 0.15-logit reranker preference became a
+    0.06 sigmoid gap that a reinforced 0.08 boost flipped. The factorial ablation
+    over the golden showed the additive form was net-negative (hit@1 0.914 vs
+    0.943 without it). So activation now only reorders candidates that are within
+    ``dyn.tie_band`` of each other in relevance — a genuine reranker tie — and
+    never touches a decision the reranker made with margin. This delivers the
+    docstring's original intent, which the additive code did not. Memories
+    without dynamics/temporality fields keep their reranked order.
     """
     dyn_active = dyn is not None and dyn.weight > 0
     temp_active = temp is not None and temp.superseded_penalty > 0
     if not memories or (not dyn_active and not temp_active):
         return memories
     now = _dynamics_utcnow()
-    keyed = []
+    enriched = []
     for doc in memories:
         meta = doc.get("metadata") or {}
         rerank_score = doc.get("rerank_score")
@@ -591,7 +598,7 @@ def _apply_post_rerank_adjustments(memories, dyn=None, temp=None, as_of=None) ->
             base = doc.get("score") or 0.0
         else:
             base = 1.0 / (1.0 + math.exp(-rerank_score))
-        adjusted = base
+        boost = 0.0
         if dyn_active:
             boost = boost_from_payload(
                 {
@@ -604,7 +611,6 @@ def _apply_post_rerank_adjustments(memories, dyn=None, temp=None, as_of=None) ->
             )
             if boost > 0:
                 doc["activation"] = round(boost, 4)
-            adjusted += dyn.weight * boost
         if temp_active and superseded_penalty_applies(
             {
                 FIELD_SUPERSEDED_BY: meta.get(FIELD_SUPERSEDED_BY),
@@ -613,10 +619,32 @@ def _apply_post_rerank_adjustments(memories, dyn=None, temp=None, as_of=None) ->
             as_of=as_of,
         ):
             doc["superseded_penalty"] = temp.superseded_penalty
-            adjusted -= temp.superseded_penalty
-        keyed.append((adjusted, doc))
-    keyed.sort(key=lambda pair: pair[0], reverse=True)
-    return [doc for _, doc in keyed]
+            base -= temp.superseded_penalty
+        enriched.append({"doc": doc, "base": base, "boost": boost})
+
+    # Primary order: relevance (reranker sigmoid minus superseded penalty).
+    enriched.sort(key=lambda e: e["base"], reverse=True)
+    if not dyn_active:
+        return [e["doc"] for e in enriched]
+
+    # Tie-break: within each run of candidates whose relevance is within
+    # tie_band of the run's leader (a genuine reranker tie), the more-activated
+    # memory wins. Outside the band, the reranker's decision stands untouched.
+    band = getattr(dyn, "tie_band", 0.0) or 0.0
+    if band <= 0:
+        # tie_band disabled → activation cannot reorder anything post-rerank.
+        return [e["doc"] for e in enriched]
+    ordered, i, n = [], 0, len(enriched)
+    while i < n:
+        leader = enriched[i]["base"]
+        j = i + 1
+        while j < n and leader - enriched[j]["base"] < band:
+            j += 1
+        group = enriched[i:j]
+        group.sort(key=lambda e: e["boost"], reverse=True)
+        ordered.extend(e["doc"] for e in group)
+        i = j
+    return ordered
 
 
 def _apply_activation_post_rerank(memories, dyn) -> List[Dict[str, Any]]:

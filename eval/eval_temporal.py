@@ -112,6 +112,10 @@ def build_memory(rerank: bool, dynamics_enabled: bool = True):
                 "collection_name": ARGS.collection,
                 "url": QDRANT_URL,
                 "embedding_model_dims": EMBED_DIMS,
+                # production Qdrant now requires auth (locked 2026-07); pass the
+                # key when present so this eval runs against the live instance.
+                **({"api_key": os.environ["MEM0_QDRANT_API_KEY"]}
+                   if os.environ.get("MEM0_QDRANT_API_KEY") else {}),
             },
         },
         "embedder": {

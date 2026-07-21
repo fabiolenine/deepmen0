@@ -168,19 +168,25 @@ class TestActivationPostRerank:
         def real_hours_ago(h):
             return (datetime.now(timezone.utc) - timedelta(hours=h)).isoformat()
 
+        # ⚠️ REALISTIC rerank logits. The bge-reranker-v2-m3 emits logits near
+        # ZERO on this corpus (measured 2026-07-21: golden logits 0.01–0.25),
+        # where sigmoid slope is steepest and gaps compress hardest. The old
+        # fixture used logits 2.0–8.0 (sigmoid ~0.88–1.0), a region the reranker
+        # NEVER reaches — so its "decisive gap" test validated a fantasy and the
+        # real overturning bug went uncaught. cold≈hot here is a TRUE near-tie.
         return [
             {
                 "id": "cold",
                 "memory": "atlas_ingest retries three times",
                 "created_at": real_hours_ago(500),
-                "rerank_score": 2.05,
+                "rerank_score": 0.020,
                 "metadata": {},
             },
             {
                 "id": "hot",
                 "memory": "atlas_ingest retries thrice",
                 "created_at": real_hours_ago(500),
-                "rerank_score": 2.00,
+                "rerank_score": 0.019,  # sigmoid gap ~0.00025 < tie_band 0.002
                 "metadata": {
                     "reinforced_at": [real_hours_ago(30), real_hours_ago(4)],
                     "access_count": 6,
@@ -189,14 +195,19 @@ class TestActivationPostRerank:
         ]
 
     def test_reinforced_memory_wins_near_tie(self):
+        # genuine tie (gap 0.00025 < tie_band): activation decides → hot wins
         dyn = MemoryDynamicsConfig()
         ordered = _apply_activation_post_rerank(self.make_docs(), dyn)
         assert ordered[0]["id"] == "hot"
         assert ordered[0]["activation"] > 0
 
     def test_decisive_rerank_gap_is_not_overturned(self):
+        # REAL operating point (regression for the 2026-07-21 overturn bug): the
+        # reranker prefers cold by a decisive 0.25-logit margin (sigmoid gap
+        # ~0.06 >> tie_band). Reinforcement must NOT flip it. The additive form
+        # (base + 0.15*activation) DID flip exactly this, on the live golden.
         docs = self.make_docs()
-        docs[0]["rerank_score"] = 8.0  # sigmoid ~1.0 vs ~0.88: gap > weight
+        docs[0]["rerank_score"] = 0.27  # vs hot 0.019: sigmoid gap ~0.062
         dyn = MemoryDynamicsConfig()
         ordered = _apply_activation_post_rerank(docs, dyn)
         assert ordered[0]["id"] == "cold"
@@ -205,6 +216,13 @@ class TestActivationPostRerank:
         dyn = MemoryDynamicsConfig(weight=0.0)
         ordered = _apply_activation_post_rerank(self.make_docs(), dyn)
         assert [d["id"] for d in ordered] == ["cold", "hot"]
+
+    def test_tie_band_zero_disables_post_rerank_reorder(self):
+        # tie_band=0 → activation cannot reorder post-rerank; reranker wins the
+        # near-tie by its (tiny) margin even against a reinforced candidate.
+        dyn = MemoryDynamicsConfig(tie_band=0.0)
+        ordered = _apply_activation_post_rerank(self.make_docs(), dyn)
+        assert ordered[0]["id"] == "cold"
 
 
 class FakeVectorStore:
