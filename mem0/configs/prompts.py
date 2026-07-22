@@ -1025,6 +1025,32 @@ guess a date.
   occurred or became true. Omit when the text gives no clear anchor.
 """
 
+# DeepMem0: appended to the extraction system prompt ONLY for document ingestion
+# (temporal_context="document"). A document's dates are historical facts with
+# nothing to do with the ingestion time, so the conversational rule "resolve ALL
+# relative references against the Observation Date" is actively harmful here: a
+# date written without a year ("17 out") must NOT be completed with the current
+# year. Placed LAST so it overrides the earlier Observation-Date block for a
+# weak (9B) extractor. Measured by scripts/eval_doc_extraction.py.
+DOCUMENT_TEMPORAL_OVERRIDE = """
+
+## DOCUMENT MODE — TEMPORAL OVERRIDE (takes precedence over the Observation Date rules above)
+
+This input is an excerpt from a DOCUMENT the user chose to memorize, NOT a live
+conversation. The rules above about resolving relative references against the
+Observation Date DO NOT APPLY to dates found in the document.
+
+- Dates in a document are historical facts. Record every date EXACTLY as written.
+- If a date is written WITHOUT a year (e.g. "17 out", "Oct 17", "17/10"), DO NOT add
+  or infer a year — neither from the Observation Date nor from today's date. Keep the
+  date partial, exactly as written.
+- NEVER change or complete a written year. If the text says 2023, it is 2023, no matter
+  what today's date is. Do not normalize or "resolve" document dates against today.
+- event_date: emit it ONLY when the text gives a FULL date (day, month AND year). A
+  two-digit year ("15/07/23") means 20YY (2023). If the year is missing, OMIT event_date
+  entirely and leave the partial date in the fact text. Never guess a year to fill it.
+"""
+
 
 def build_temporality_suffix(include_event_date: bool = True) -> str:
     """DeepMem0 v0.3: extraction-prompt suffix for semantic temporality."""

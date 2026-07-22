@@ -21,6 +21,7 @@ from mem0.configs.enums import MemoryType
 from mem0.configs.prompts import (
     ADDITIVE_EXTRACTION_PROMPT,
     AGENT_CONTEXT_SUFFIX,
+    DOCUMENT_TEMPORAL_OVERRIDE,
     PROCEDURAL_MEMORY_SYSTEM_PROMPT,
     build_temporality_suffix,
     generate_additive_extraction_prompt,
@@ -953,6 +954,7 @@ class Memory(MemoryBase):
         infer: bool = True,
         memory_type: Optional[str] = None,
         prompt: Optional[str] = None,
+        temporal_context: str = "conversation",
     ):
         """
         Create a new memory.
@@ -976,6 +978,10 @@ class Memory(MemoryBase):
                 creating procedural memories (typically requires 'agent_id'). Otherwise, memories
                 are treated as general conversational/factual memories.
             prompt (str, optional): Prompt to use for the memory creation. Defaults to None.
+            temporal_context (str, optional): "conversation" (default) resolves relative dates
+                ("yesterday") against the observation/ingestion time. "document" disables that
+                resolution: document dates are historical facts, taken only as written — a date
+                without a year is never completed with the current year. Use for add_document.
 
 
         Returns:
@@ -1039,7 +1045,10 @@ class Memory(MemoryBase):
         else:
             messages = parse_vision_messages(messages)
 
-        vector_store_result = self._add_to_vector_store(messages, processed_metadata, effective_filters, infer, prompt=prompt)
+        vector_store_result = self._add_to_vector_store(
+            messages, processed_metadata, effective_filters, infer,
+            prompt=prompt, temporal_context=temporal_context,
+        )
         scale_threshold_notice = detect_scale_threshold_from_add_result(self, vector_store_result)
         if temporal_usage_notice:
             display_temporal_usage_notice(self, "sync", "add", *temporal_usage_notice)
@@ -1049,7 +1058,7 @@ class Memory(MemoryBase):
             display_first_run_notice(self, "sync", "add")
         return {"results": vector_store_result}
 
-    def _add_to_vector_store(self, messages, metadata, filters, infer, prompt=None):
+    def _add_to_vector_store(self, messages, metadata, filters, infer, prompt=None, temporal_context="conversation"):
         if not infer:
             returned_memories = []
             for message_dict in messages:
@@ -1119,6 +1128,10 @@ class Memory(MemoryBase):
         if temp is not None:
             # DeepMem0 v0.3: same call also detects supersession (+ event_date).
             system_prompt += build_temporality_suffix(include_event_date=temp.extract_event_date)
+        if temporal_context == "document":
+            # DeepMem0: a document keeps its OWN dates; disable Observation-Date
+            # resolution so a year-less date is never filled with the current year.
+            system_prompt += DOCUMENT_TEMPORAL_OVERRIDE
 
         custom_instr = prompt or self.custom_instructions
 
@@ -2679,6 +2692,7 @@ class AsyncMemory(MemoryBase):
         infer: bool = True,
         memory_type: Optional[str] = None,
         prompt: Optional[str] = None,
+        temporal_context: str = "conversation",
         llm=None,
     ):
         """
@@ -2744,7 +2758,10 @@ class AsyncMemory(MemoryBase):
         else:
             messages = parse_vision_messages(messages)
 
-        vector_store_result = await self._add_to_vector_store(messages, processed_metadata, effective_filters, infer, prompt=prompt)
+        vector_store_result = await self._add_to_vector_store(
+            messages, processed_metadata, effective_filters, infer,
+            prompt=prompt, temporal_context=temporal_context,
+        )
         scale_threshold_notice = await asyncio.to_thread(detect_scale_threshold_from_add_result, self, vector_store_result)
         if temporal_usage_notice:
             await display_temporal_usage_notice_async(self, "async", "add", *temporal_usage_notice)
@@ -2761,6 +2778,7 @@ class AsyncMemory(MemoryBase):
         effective_filters: dict,
         infer: bool,
         prompt: Optional[str] = None,
+        temporal_context: str = "conversation",
     ):
         if not infer:
             returned_memories = []
@@ -2832,6 +2850,10 @@ class AsyncMemory(MemoryBase):
         if temp is not None:
             # DeepMem0 v0.3: same call also detects supersession (+ event_date).
             system_prompt += build_temporality_suffix(include_event_date=temp.extract_event_date)
+        if temporal_context == "document":
+            # DeepMem0: a document keeps its OWN dates; disable Observation-Date
+            # resolution so a year-less date is never filled with the current year.
+            system_prompt += DOCUMENT_TEMPORAL_OVERRIDE
 
         custom_instr = prompt or self.custom_instructions
 
