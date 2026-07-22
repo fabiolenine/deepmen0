@@ -23,6 +23,7 @@ class OllamaConfig(BaseLlmConfig):
         http_client_proxies: Optional[dict] = None,
         # Ollama-specific parameters
         ollama_base_url: Optional[str] = None,
+        vision_model: Optional[str] = None,
     ):
         """
         Initialize Ollama configuration.
@@ -38,6 +39,12 @@ class OllamaConfig(BaseLlmConfig):
             vision_details: Vision detail level, defaults to "auto"
             http_client_proxies: HTTP client proxy settings, defaults to None
             ollama_base_url: Ollama base URL, defaults to None
+            vision_model: Ollama model used ONLY for calls that carry an image
+                (e.g. a VLM such as ``llava`` or ``qwen3-vl``), while ``model``
+                stays the text model. Defaults to None (image calls reuse
+                ``model``). Useful when the text and vision models cannot share
+                GPU memory and must be swapped. Ollama-specific; not part of the
+                common LLM config.
         """
         # Initialize base parameters
         super().__init__(
@@ -54,3 +61,5 @@ class OllamaConfig(BaseLlmConfig):
 
         # Ollama-specific parameters
         self.ollama_base_url = ollama_base_url
+        # treat empty string as unset (uses `model` for image calls)
+        self.vision_model = vision_model or None

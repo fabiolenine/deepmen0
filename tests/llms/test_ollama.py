@@ -140,3 +140,164 @@ def test_parse_response_with_tools_object_style(mock_ollama_client):
     result = llm._parse_response(mock_response, tools)
 
     assert result["tool_calls"] == [{"name": "extract", "arguments": {"entities": ["Alice"]}}]
+
+
+# ---------------------------------------------------------------------------
+# Vision: OpenAI image_url -> Ollama images translation + vision_model routing
+# (added for the ollama-native vision fix). The pure normalizer is table-tested;
+# generate_response is checked against a mocked Client for wire shape + routing.
+# ---------------------------------------------------------------------------
+import base64
+
+from mem0.llms.ollama import _extract_ollama_image, _ollama_messages
+
+_PNG_B64 = base64.b64encode(b"\x89PNG\r\n\x1a\nHELLO").decode()
+_DATA_URI = f"data:image/png;base64,{_PNG_B64}"
+
+
+def _img_msg(url):
+    return {"role": "user", "content": [
+        {"type": "text", "text": "describe"},
+        {"type": "image_url", "image_url": {"url": url}},
+    ]}
+
+
+def test_normalizer_data_uri_stripped_to_raw_base64():
+    out, has = _ollama_messages([_img_msg(_DATA_URI)])
+    assert has is True
+    assert out[0]["content"] == "describe"
+    # the "data:...;base64," prefix must be gone (Ollama b64decodes the value)
+    assert out[0]["images"] == [_PNG_B64]
+
+
+def test_normalizer_local_path_passthrough():
+    out, has = _ollama_messages([_img_msg("/tmp/pic.png")])
+    assert has is True
+    assert out[0]["images"] == ["/tmp/pic.png"]
+
+
+def test_normalizer_multiple_images_and_text_order():
+    msg = {"role": "user", "content": [
+        {"type": "text", "text": "a"},
+        {"type": "image_url", "image_url": {"url": _PNG_B64}},
+        {"type": "text", "text": "b"},
+        {"type": "image_url", "image_url": {"url": "/tmp/x.png"}},
+    ]}
+    out, _ = _ollama_messages([msg])
+    assert out[0]["content"] == "a b"            # text order preserved
+    assert out[0]["images"] == [_PNG_B64, "/tmp/x.png"]  # every image kept
+
+
+def test_normalizer_image_only_message():
+    msg = {"role": "user", "content": [{"type": "image_url", "image_url": {"url": _PNG_B64}}]}
+    out, has = _ollama_messages([msg])
+    assert has is True
+    assert out[0]["content"] == ""
+    assert out[0]["images"] == [_PNG_B64]
+
+
+def test_normalizer_unknown_part_ignored():
+    msg = {"role": "user", "content": [
+        {"type": "text", "text": "hi"},
+        {"type": "input_audio", "audio": "..."},  # unknown -> dropped, no crash
+    ]}
+    out, has = _ollama_messages([msg])
+    assert has is False
+    assert out[0]["content"] == "hi"
+    assert "images" not in out[0]
+
+
+def test_normalizer_plain_message_passthrough_and_immutability():
+    original = [{"role": "user", "content": [{"type": "text", "text": "x"}]},
+                {"role": "system", "content": "sys"}]
+    out, has = _ollama_messages(original)
+    # input not mutated
+    assert isinstance(original[0]["content"], list)
+    assert out[1] == {"role": "system", "content": "sys"}
+
+
+def test_extract_image_rejects_http():
+    for bad in ("http://h/x.png", "https://h/x.png"):
+        with pytest.raises(ValueError, match="http"):
+            _extract_ollama_image({"url": bad})
+
+
+def test_extract_image_rejects_malformed_data_uri():
+    for bad in ("data:image/png,notb64", "data:image/png;base64,@@@@", "data:x;base64,"):
+        with pytest.raises(ValueError):
+            _extract_ollama_image({"url": bad})
+
+
+def test_generate_response_translates_image_to_ollama_images(mock_ollama_client):
+    config = OllamaConfig(model="qwen-text", enable_vision=True)
+    llm = OllamaLLM(config)
+    mock_ollama_client.chat.return_value = {"message": {"content": "a red square"}}
+
+    llm.generate_response(messages=[_img_msg(_DATA_URI)])
+
+    _, kwargs = mock_ollama_client.chat.call_args
+    sent = kwargs["messages"][0]
+    assert sent["images"] == [_PNG_B64]          # image reached `images`
+    assert sent["content"] == "describe"
+    assert not isinstance(sent["content"], list)  # never an image_url content part
+    assert kwargs["model"] == "qwen-text"         # no vision_model -> uses model
+
+
+def test_generate_response_routes_to_vision_model_when_image_present(mock_ollama_client):
+    config = OllamaConfig(model="qwen-text", vision_model="qwen3-vl", enable_vision=True)
+    llm = OllamaLLM(config)
+    mock_ollama_client.chat.return_value = {"message": {"content": "ok"}}
+
+    llm.generate_response(messages=[_img_msg(_DATA_URI)])
+    assert mock_ollama_client.chat.call_args.kwargs["model"] == "qwen3-vl"
+
+
+def test_generate_response_text_only_ignores_vision_model(mock_ollama_client):
+    config = OllamaConfig(model="qwen-text", vision_model="qwen3-vl")
+    llm = OllamaLLM(config)
+    mock_ollama_client.chat.return_value = {"message": {"content": "ok"}}
+
+    llm.generate_response(messages=[{"role": "user", "content": "no image here"}])
+    # no image -> vision_model must NOT hijack the call
+    assert mock_ollama_client.chat.call_args.kwargs["model"] == "qwen-text"
+
+
+def test_vision_model_config_treats_empty_string_as_unset():
+    assert OllamaConfig(model="m", vision_model="").vision_model is None
+    assert OllamaConfig(model="m").vision_model is None
+    assert OllamaConfig(model="m", vision_model="vlm").vision_model == "vlm"
+
+
+def test_generate_response_image_plus_json_format(mock_ollama_client):
+    """Regression: the json_object block appends to content; it must run AFTER
+    multimodal normalization (else content is a list and += raises TypeError)."""
+    config = OllamaConfig(model="qwen-text", vision_model="qwen3-vl")
+    llm = OllamaLLM(config)
+    mock_ollama_client.chat.return_value = {"message": {"content": "{}"}}
+
+    llm.generate_response(messages=[_img_msg(_DATA_URI)],
+                          response_format={"type": "json_object"})
+
+    kwargs = mock_ollama_client.chat.call_args.kwargs
+    assert kwargs["format"] == "json"
+    assert kwargs["model"] == "qwen3-vl"
+    last = kwargs["messages"][-1]
+    assert "Please respond with valid JSON only." in last["content"]
+    assert last["images"] == [_PNG_B64]
+
+
+def test_generate_response_text_only_unchanged_regression(mock_ollama_client):
+    """A plain text call must produce the exact same client.chat args as before
+    the vision change (byte-for-byte guard)."""
+    config = OllamaConfig(model="llama3.1:70b", temperature=0.7, max_tokens=100, top_p=1.0)
+    llm = OllamaLLM(config)
+    messages = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "Hello, how are you?"},
+    ]
+    mock_ollama_client.chat.return_value = {"message": {"content": "hi"}}
+    llm.generate_response(messages)
+    mock_ollama_client.chat.assert_called_once_with(
+        model="llama3.1:70b", messages=messages,
+        options={"temperature": 0.7, "num_predict": 100, "top_p": 1.0},
+    )
