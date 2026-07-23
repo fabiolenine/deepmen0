@@ -57,6 +57,65 @@ def _mocked_memory(llm_response):
 _MSG = [{"role": "user", "content": "The contract Sorocaba expires 17/10, R$ 812."}]
 
 
+def test_document_mode_does_not_write_history_sync():
+    """Write-gate: document mode must NOT call save_messages (the bleed source)."""
+    with _mocked_memory("{}") as (mem, cap):
+        mem._add_to_vector_store(_MSG, {}, {}, True, temporal_context="document")
+    mem.db.save_messages.assert_not_called()
+
+
+def test_conversation_mode_writes_history_sync():
+    """Regression: conversation mode still saves to the message history."""
+    with _mocked_memory("{}") as (mem, cap):
+        mem._add_to_vector_store(_MSG, {}, {}, True, temporal_context="conversation")
+    mem.db.save_messages.assert_called()
+
+
+@contextmanager
+def _mocked_async_memory(llm_response):
+    """AsyncMemory with factories mocked (async path — the /critic-results gap)."""
+    import asyncio
+    from unittest.mock import AsyncMock
+    from mem0.memory.main import AsyncMemory
+    embedder = MagicMock()
+    vstore = MagicMock()
+    vstore.return_value.search.return_value = []
+    llm = MagicMock()
+    with patch("mem0.utils.factory.EmbedderFactory.create", embedder), \
+         patch("mem0.utils.factory.VectorStoreFactory.create",
+               side_effect=[vstore.return_value, MagicMock()]), \
+         patch("mem0.utils.factory.LlmFactory.create", llm), \
+         patch("mem0.memory.storage.SQLiteManager", MagicMock()):
+        mem = AsyncMemory()
+        mem.custom_instructions = None
+        mem.db.get_last_messages = MagicMock(return_value=[])
+        mem.db.save_messages = MagicMock()
+        cap = {}
+
+        def _gen(messages, **kw):
+            cap["system"] = messages[0]["content"]
+            return llm_response
+        mem.llm.generate_response = MagicMock(side_effect=_gen)
+        yield mem, cap
+
+
+def test_document_mode_async_override_and_no_write():
+    """Async path: override in system prompt AND save_messages gated (mirror of sync)."""
+    import asyncio
+    with _mocked_async_memory("{}") as (mem, cap):
+        asyncio.run(mem._add_to_vector_store(_MSG, {}, {}, True, temporal_context="document"))
+    assert "DOCUMENT MODE — TEMPORAL OVERRIDE" in cap["system"]
+    mem.db.save_messages.assert_not_called()
+
+
+def test_conversation_mode_async_writes_history():
+    import asyncio
+    with _mocked_async_memory("{}") as (mem, cap):
+        asyncio.run(mem._add_to_vector_store(_MSG, {}, {}, True, temporal_context="conversation"))
+    assert "TEMPORAL OVERRIDE" not in cap["system"]
+    mem.db.save_messages.assert_called()
+
+
 def test_document_context_appends_override():
     with _mocked_memory("{}") as (mem, cap):
         mem._add_to_vector_store(_MSG, {}, {}, True, temporal_context="document")
