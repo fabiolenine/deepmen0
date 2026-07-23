@@ -1782,7 +1782,9 @@ class Memory(MemoryBase):
 
         search_start = time.perf_counter()
         original_memories = self._search_vector_store(
-            query, effective_filters, fetch_limit, threshold, explain=explain, as_of_dt=as_of_dt
+            query, effective_filters, fetch_limit, threshold, explain=explain, as_of_dt=as_of_dt,
+            dense_anchors=(getattr(self.config, "rerank_dense_anchors", 5)
+                           if (rerank and self.reranker) else 0),
         )
         search_elapsed_seconds = time.perf_counter() - search_start
 
@@ -1946,7 +1948,7 @@ class Memory(MemoryBase):
                 return True
         return False
 
-    def _search_vector_store(self, query, filters, limit, threshold=0.1, explain=False, as_of_dt=None):
+    def _search_vector_store(self, query, filters, limit, threshold=0.1, explain=False, as_of_dt=None, dense_anchors=0):
         # Guard against None threshold (backward compat)
         if threshold is None:
             threshold = 0.1
@@ -2028,6 +2030,20 @@ class Memory(MemoryBase):
             activation_weight=dyn.weight if dyn is not None else 0.0,
             penalties=superseded_penalties or None,
         )
+
+        # DeepMem0: DENSE ANCHORS — a fusão corta o pool por score FUNDIDO, então
+        # um alvo denso-forte enterrado por boosts ruidosos (entity/activation de
+        # competidores) sai do pool ANTES do reranker e o resgate-por-rerank da F1
+        # nunca acontece (medido: alvo denso rank 1-2, fundido rank 21-40, sumia
+        # do top-10 quando o corpus cresceu 620->984). Garantia: o denso-top-N
+        # sempre entra no pool do reranker — só ADICIONA candidatos; o
+        # cross-encoder decide. Ativo apenas no caminho com rerank.
+        if dense_anchors > 0:
+            seen_ids = {r["id"] for r in scored_results}
+            for cand in candidates[:dense_anchors]:
+                if cand["id"] not in seen_ids:
+                    scored_results.append(cand)
+                    seen_ids.add(cand["id"])
 
         # Step 9: Format results
         promoted_payload_keys = [
@@ -3528,7 +3544,9 @@ class AsyncMemory(MemoryBase):
 
         search_start = time.perf_counter()
         original_memories = await self._search_vector_store(
-            query, effective_filters, fetch_limit, threshold, explain=explain, as_of_dt=as_of_dt
+            query, effective_filters, fetch_limit, threshold, explain=explain, as_of_dt=as_of_dt,
+            dense_anchors=(getattr(self.config, "rerank_dense_anchors", 5)
+                           if (rerank and self.reranker) else 0),
         )
         search_elapsed_seconds = time.perf_counter() - search_start
 
@@ -3690,7 +3708,7 @@ class AsyncMemory(MemoryBase):
                 return True
         return False
 
-    async def _search_vector_store(self, query, filters, limit, threshold=0.1, explain=False, as_of_dt=None):
+    async def _search_vector_store(self, query, filters, limit, threshold=0.1, explain=False, as_of_dt=None, dense_anchors=0):
         if threshold is None:
             threshold = 0.1
 
@@ -3769,6 +3787,20 @@ class AsyncMemory(MemoryBase):
             activation_weight=dyn.weight if dyn is not None else 0.0,
             penalties=superseded_penalties or None,
         )
+
+        # DeepMem0: DENSE ANCHORS — a fusão corta o pool por score FUNDIDO, então
+        # um alvo denso-forte enterrado por boosts ruidosos (entity/activation de
+        # competidores) sai do pool ANTES do reranker e o resgate-por-rerank da F1
+        # nunca acontece (medido: alvo denso rank 1-2, fundido rank 21-40, sumia
+        # do top-10 quando o corpus cresceu 620->984). Garantia: o denso-top-N
+        # sempre entra no pool do reranker — só ADICIONA candidatos; o
+        # cross-encoder decide. Ativo apenas no caminho com rerank.
+        if dense_anchors > 0:
+            seen_ids = {r["id"] for r in scored_results}
+            for cand in candidates[:dense_anchors]:
+                if cand["id"] not in seen_ids:
+                    scored_results.append(cand)
+                    seen_ids.add(cand["id"])
 
         # Step 9: Format results
         promoted_payload_keys = [
