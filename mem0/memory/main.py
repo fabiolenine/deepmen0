@@ -998,6 +998,12 @@ class Memory(MemoryBase):
         """
         if timestamp is not None:
             raise ValueError(get_temporal_feature_error_message("sync", "add", "timestamp"))
+        if temporal_context not in ("conversation", "document"):
+            # fail-closed: um typo ("Document", "doc") viraria silenciosamente o modo
+            # conversacional — e o override de datas de documento sumiria sem sinal.
+            raise ValueError(
+                f"temporal_context inválido: {temporal_context!r} (use 'conversation' ou 'document')"
+            )
 
         temporal_usage_notice = detect_temporal_usage_from_metadata(metadata)
         processed_metadata, effective_filters = _build_filters_and_metadata(
@@ -2723,6 +2729,11 @@ class AsyncMemory(MemoryBase):
         """
         if timestamp is not None:
             raise ValueError(await get_temporal_feature_error_message_async("async", "add", "timestamp"))
+        if temporal_context not in ("conversation", "document"):
+            # fail-closed (espelha o sync): typo não pode virar modo conversacional mudo
+            raise ValueError(
+                f"temporal_context inválido: {temporal_context!r} (use 'conversation' ou 'document')"
+            )
 
         temporal_usage_notice = detect_temporal_usage_from_metadata(metadata)
         processed_metadata, effective_filters = _build_filters_and_metadata(

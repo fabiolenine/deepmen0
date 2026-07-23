@@ -161,3 +161,13 @@ def test_event_date_survives_to_stored_payload():
     assert payloads, "vector_store.insert was not called with payloads"
     assert any(p.get("event_date") == "2027-09-01" for p in payloads), \
         f"event_date lost before storage; payloads={payloads}"
+
+
+def test_invalid_temporal_context_fails_closed():
+    """Typo não pode degradar silenciosamente p/ conversation (fail-open era o
+    risco: o override de datas sumiria sem sinal)."""
+    import pytest as _pytest
+    with _mocked_memory("{}") as (mem, cap):
+        for bad in ("Document", "doc", "", None, 42):
+            with _pytest.raises((ValueError, TypeError)):
+                mem.add(_MSG, user_id="u", temporal_context=bad)
