@@ -218,3 +218,59 @@ def test_event_date_not_inferred_in_conversation_mode():
             mem._add_to_vector_store(_MSG, {}, {}, True, temporal_context="conversation")
     payloads = (cap.get("insert") or {}).get("payloads") or []
     assert payloads and all(not p.get("event_date") for p in payloads)
+
+
+def test_event_date_text_wins_over_contradictory_llm_date():
+    """Cross-validação (parecer): LLM emite data VÁLIDA-mas-ERRADA (ex.: ano
+    corrente); em modo documento a data ESCRITA no texto vence."""
+    from types import SimpleNamespace
+    resp = json.dumps({"memory": [
+        {"id": "0", "text": "A reserva foi confirmada em 15/07/2023",
+         "attributed_to": "document", "event_date": "2026-07-15"}  # ERRADA
+    ]})
+    temp = SimpleNamespace(extract_event_date=True, superseded_penalty=0.2, enabled=True)
+    with _mocked_memory(resp) as (mem, cap):
+        with patch("mem0.memory.main._temporality_config", return_value=temp):
+            mem._add_to_vector_store(_MSG, {}, {}, True, temporal_context="document")
+    payloads = (cap.get("insert") or {}).get("payloads") or []
+    assert any(p.get("event_date") == "2023-07-15" for p in payloads), \
+        f"data do texto não venceu a do LLM; payloads={payloads}"
+
+
+def test_event_date_llm_survives_when_text_ambiguous():
+    """Com o texto AMBÍGUO (duas datas), a data do LLM fica (não há verdade única
+    no texto para cross-validar)."""
+    from types import SimpleNamespace
+    resp = json.dumps({"memory": [
+        {"id": "0", "text": "Check-in 18 de outubro de 2023 e check-out 20 de outubro de 2023",
+         "attributed_to": "document", "event_date": "2023-10-18"}
+    ]})
+    temp = SimpleNamespace(extract_event_date=True, superseded_penalty=0.2, enabled=True)
+    with _mocked_memory(resp) as (mem, cap):
+        with patch("mem0.memory.main._temporality_config", return_value=temp):
+            mem._add_to_vector_store(_MSG, {}, {}, True, temporal_context="document")
+    payloads = (cap.get("insert") or {}).get("payloads") or []
+    assert any(p.get("event_date") == "2023-10-18" for p in payloads)
+
+
+def test_document_mode_does_not_read_history():
+    """READ-side do bleed (gap do parecer): um canário no histórico CONVERSACIONAL
+    não pode entrar no prompt de um add em modo document (get_last_messages
+    desligado, não só save)."""
+    CANARY = "CONVCANARY-8Q2Z"
+    with _mocked_memory("{}") as (mem, cap):
+        mem.db.get_last_messages = MagicMock(
+            return_value=[{"role": "user", "content": f"segredo {CANARY}"}])
+        captured_user = {}
+        orig = mem.llm.generate_response.side_effect
+        def _gen(messages, **kw):
+            captured_user["user"] = next(
+                (m["content"] for m in messages if m.get("role") == "user"), "")
+            return orig(messages, **kw)
+        mem.llm.generate_response = MagicMock(side_effect=_gen)
+        mem._add_to_vector_store(_MSG, {}, {}, True, temporal_context="document")
+        assert CANARY not in captured_user["user"], "doc-mode LEU o histórico conversacional!"
+        mem.db.get_last_messages.assert_not_called()
+        # controle: em conversation o histórico ENTRA
+        mem._add_to_vector_store(_MSG, {}, {}, True, temporal_context="conversation")
+        assert CANARY in captured_user["user"], "conversation deixou de ler o histórico (regressão)"

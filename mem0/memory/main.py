@@ -1258,11 +1258,21 @@ class Memory(MemoryBase):
                     pending_supersessions.append((memory_id, text, supersedes_ids, mem_metadata["created_at"]))
                 if temp.extract_event_date:
                     event_date = parse_event_date(mem.get("event_date"))
-                    if not event_date and temporal_context == "document":
+                    if temporal_context == "document":
                         # medido: o extrator pequeno escreve a data no TEXTO do
-                        # fato mas omite o campo (0/185). Fallback determinístico,
-                        # só data COMPLETA e única no texto — nunca adivinha.
-                        event_date = infer_event_date_from_text(text)
+                        # fato mas omite o campo (0/185); e pode emitir uma data
+                        # VÁLIDA-mas-ERRADA (ex.: ano corrente). Em modo documento
+                        # a data ESCRITA vence: se o texto tem exatamente UMA data
+                        # completa, ela é a verdade (cross-validação do parecer).
+                        text_date = infer_event_date_from_text(text)
+                        if text_date and event_date and event_date != text_date:
+                            logger.warning(
+                                f"event_date do LLM ({event_date}) contradiz a data do texto "
+                                f"({text_date}) em modo documento — usando a do texto"
+                            )
+                            event_date = text_date
+                        elif not event_date:
+                            event_date = text_date
                     if event_date:
                         mem_metadata["event_date"] = event_date
 
@@ -2991,11 +3001,21 @@ class AsyncMemory(MemoryBase):
                     pending_supersessions.append((memory_id, text, supersedes_ids, mem_metadata["created_at"]))
                 if temp.extract_event_date:
                     event_date = parse_event_date(mem.get("event_date"))
-                    if not event_date and temporal_context == "document":
+                    if temporal_context == "document":
                         # medido: o extrator pequeno escreve a data no TEXTO do
-                        # fato mas omite o campo (0/185). Fallback determinístico,
-                        # só data COMPLETA e única no texto — nunca adivinha.
-                        event_date = infer_event_date_from_text(text)
+                        # fato mas omite o campo (0/185); e pode emitir uma data
+                        # VÁLIDA-mas-ERRADA (ex.: ano corrente). Em modo documento
+                        # a data ESCRITA vence: se o texto tem exatamente UMA data
+                        # completa, ela é a verdade (cross-validação do parecer).
+                        text_date = infer_event_date_from_text(text)
+                        if text_date and event_date and event_date != text_date:
+                            logger.warning(
+                                f"event_date do LLM ({event_date}) contradiz a data do texto "
+                                f"({text_date}) em modo documento — usando a do texto"
+                            )
+                            event_date = text_date
+                        elif not event_date:
+                            event_date = text_date
                     if event_date:
                         mem_metadata["event_date"] = event_date
 
