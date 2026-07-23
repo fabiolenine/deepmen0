@@ -171,3 +171,50 @@ def test_invalid_temporal_context_fails_closed():
         for bad in ("Document", "doc", "", None, 42):
             with _pytest.raises((ValueError, TypeError)):
                 mem.add(_MSG, user_id="u", temporal_context=bad)
+
+
+def test_infer_event_date_from_text_table():
+    """Post-parser determinístico (fase 3 do event_date): só data COMPLETA e única."""
+    from mem0.utils.temporality import infer_event_date_from_text as f
+    assert f("check-in em 18 de outubro de 2023") == "2023-10-18"
+    assert f("reserva confirmada em 15/07/2023") == "2023-07-15"
+    assert f("emitido em 15/07/23") == "2023-07-15"          # 2 dígitos = 20YY
+    assert f("meeting on October 5, 2024") == "2024-10-05"   # EN
+    assert f("prazo 2027-09-01 registrado") == "2027-09-01"  # ISO no texto
+    assert f("retirada em 17 out às 22:00") is None          # SEM ano -> nunca inferir
+    assert f("de 18 de outubro de 2023 a 20 de outubro de 2023 e 15/07/2023") is None  # múltiplas -> ambíguo
+    assert f("check-in 18 de outubro de 2023 confirmado em 18/10/2023") == "2023-10-18"  # MESMA data 2 formas
+    assert f("31/02/2023 inválida") is None                  # data impossível
+    assert f("") is None and f(None) is None
+
+
+def test_event_date_inferred_from_text_when_llm_omits_field():
+    """O caso REAL do 0/185: LLM põe a data no texto, omite o campo. Em modo
+    document com temporalidade ligada, o post-parser preenche."""
+    from types import SimpleNamespace
+    resp = json.dumps({"memory": [
+        {"id": "0", "text": "A reserva do Hotel Qintara foi confirmada em 15/07/2023",
+         "attributed_to": "document"}  # SEM event_date — como o qwen faz
+    ]})
+    temp = SimpleNamespace(extract_event_date=True, superseded_penalty=0.2, enabled=True)
+    with _mocked_memory(resp) as (mem, cap):
+        with patch("mem0.memory.main._temporality_config", return_value=temp):
+            mem._add_to_vector_store(_MSG, {}, {}, True, temporal_context="document")
+    payloads = (cap.get("insert") or {}).get("payloads") or []
+    assert any(p.get("event_date") == "2023-07-15" for p in payloads), \
+        f"post-parser não preencheu event_date; payloads={payloads}"
+
+
+def test_event_date_not_inferred_in_conversation_mode():
+    """Conservador: em conversa o fallback NÃO roda (resolução relativa é papel
+    do LLM com Observation Date; não adivinhar por trás dele)."""
+    from types import SimpleNamespace
+    resp = json.dumps({"memory": [
+        {"id": "0", "text": "Reunião confirmada em 15/07/2023", "attributed_to": "user"}
+    ]})
+    temp = SimpleNamespace(extract_event_date=True, superseded_penalty=0.2, enabled=True)
+    with _mocked_memory(resp) as (mem, cap):
+        with patch("mem0.memory.main._temporality_config", return_value=temp):
+            mem._add_to_vector_store(_MSG, {}, {}, True, temporal_context="conversation")
+    payloads = (cap.get("insert") or {}).get("payloads") or []
+    assert payloads and all(not p.get("event_date") for p in payloads)

@@ -85,6 +85,7 @@ from mem0.utils.temporality import (
     FIELD_SUPERSEDED_AT,
     FIELD_SUPERSEDED_BY,
     FIELD_SUPERSEDES,
+    infer_event_date_from_text,
     parse_as_of,
     parse_event_date,
     parse_supersedes_ids,
@@ -1257,6 +1258,11 @@ class Memory(MemoryBase):
                     pending_supersessions.append((memory_id, text, supersedes_ids, mem_metadata["created_at"]))
                 if temp.extract_event_date:
                     event_date = parse_event_date(mem.get("event_date"))
+                    if not event_date and temporal_context == "document":
+                        # medido: o extrator pequeno escreve a data no TEXTO do
+                        # fato mas omite o campo (0/185). Fallback determinístico,
+                        # só data COMPLETA e única no texto — nunca adivinha.
+                        event_date = infer_event_date_from_text(text)
                     if event_date:
                         mem_metadata["event_date"] = event_date
 
@@ -2985,6 +2991,11 @@ class AsyncMemory(MemoryBase):
                     pending_supersessions.append((memory_id, text, supersedes_ids, mem_metadata["created_at"]))
                 if temp.extract_event_date:
                     event_date = parse_event_date(mem.get("event_date"))
+                    if not event_date and temporal_context == "document":
+                        # medido: o extrator pequeno escreve a data no TEXTO do
+                        # fato mas omite o campo (0/185). Fallback determinístico,
+                        # só data COMPLETA e única no texto — nunca adivinha.
+                        event_date = infer_event_date_from_text(text)
                     if event_date:
                         mem_metadata["event_date"] = event_date
 

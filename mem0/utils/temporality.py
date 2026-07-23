@@ -84,6 +84,73 @@ def parse_event_date(raw: Any) -> Optional[str]:
     return date_part
 
 
+# --- deterministic event_date fallback (measured need: the small extractor puts
+# the date in the fact TEXT but omits the structured field — 0/185 on document
+# ingestion even with the suffix in the prompt). Conservative by design: only a
+# FULL, unambiguous date counts; if the text has zero or MULTIPLE distinct full
+# dates, return None (never guess). Year-less dates never infer a year. --------
+
+_MONTHS = {
+    # pt
+    "janeiro": 1, "fevereiro": 2, "março": 3, "marco": 3, "abril": 4, "maio": 5,
+    "junho": 6, "julho": 7, "agosto": 8, "setembro": 9, "outubro": 10,
+    "novembro": 11, "dezembro": 12,
+    # en
+    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+    "july": 7, "august": 8, "september": 9, "october": 10, "november": 11,
+    "december": 12,
+}
+_ISO_TXT_RE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
+_NUM_DATE_RE = re.compile(r"\b(\d{1,2})/(\d{1,2})/(\d{2}|\d{4})\b")
+_NAME_DATE_RE = re.compile(
+    r"\b(\d{1,2})(?:º|o)?\s+(?:de\s+)?([A-Za-zçÇ]+)(?:\s+(?:de|of|,)?\s*(\d{4}))\b",
+    re.IGNORECASE,
+)
+# EN month-first: "October 5, 2024" / "October 5 2024"
+_NAME_DATE_MF_RE = re.compile(
+    r"\b([A-Za-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})\b",
+    re.IGNORECASE,
+)
+
+
+def infer_event_date_from_text(text: Any) -> Optional[str]:
+    """Extract ONE unambiguous full date (day+month+year) from a fact's text.
+
+    Returns ``YYYY-MM-DD`` when the text contains exactly one distinct full
+    date; ``None`` when it has none or several different ones (ambiguous —
+    which event would it anchor?). Two-digit years follow the documented
+    20YY rule. Purely deterministic: complements the LLM's event_date when the
+    model wrote the date into the sentence but skipped the structured field.
+    """
+    if not isinstance(text, str) or not text:
+        return None
+    found: set = set()
+    for y, m, d in _ISO_TXT_RE.findall(text):
+        found.add((int(y), int(m), int(d)))
+    for d, m, y in _NUM_DATE_RE.findall(text):
+        year = int(y) if len(y) == 4 else 2000 + int(y)
+        found.add((year, int(m), int(d)))
+    for d, mname, y in _NAME_DATE_RE.findall(text):
+        month = _MONTHS.get(mname.lower())
+        if month:
+            found.add((int(y), month, int(d)))
+    for mname, d, y in _NAME_DATE_MF_RE.findall(text):
+        month = _MONTHS.get(mname.lower())
+        if month:
+            found.add((int(y), month, int(d)))
+    valid = set()
+    for y, m, d in found:
+        try:
+            datetime(year=y, month=m, day=d)
+        except ValueError:
+            continue
+        valid.add((y, m, d))
+    if len(valid) != 1:
+        return None
+    y, m, d = next(iter(valid))
+    return f"{y:04d}-{m:02d}-{d:02d}"
+
+
 def parse_as_of(value: Any) -> Tuple[str, datetime]:
     """Parse a caller-provided ``as_of`` anchor. Fail-fast on bad input.
 
