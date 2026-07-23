@@ -1099,7 +1099,12 @@ class Memory(MemoryBase):
 
         # Phase 0: Context gathering
         session_scope = _build_session_scope(filters)
-        last_messages = self.db.get_last_messages(session_scope, limit=10)
+        # DeepMem0: a document must NOT read from nor write to the conversational
+        # message history — otherwise its chunks bleed into later adds via last_k
+        # (proven with a reservation-number canary; leaks PII). Each doc chunk is
+        # extracted standalone.
+        skip_doc_history = temporal_context == "document"
+        last_messages = [] if skip_doc_history else self.db.get_last_messages(session_scope, limit=10)
         parsed_messages = parse_messages(messages)
 
         # Phase 1: Existing memory retrieval
@@ -1174,7 +1179,8 @@ class Memory(MemoryBase):
 
         if not extracted_memories:
             # Save messages even if nothing extracted
-            self.db.save_messages(messages, session_scope)
+            if not skip_doc_history:
+                self.db.save_messages(messages, session_scope)
             return []
 
         # Phase 3: Batch embed all extracted memory texts
@@ -1251,7 +1257,8 @@ class Memory(MemoryBase):
             records.append((memory_id, text, embed_map[text], mem_metadata))
 
         if not records:
-            self.db.save_messages(messages, session_scope)
+            if not skip_doc_history:
+                self.db.save_messages(messages, session_scope)
             return []
 
         # Phase 6: Batch persist
@@ -1413,7 +1420,8 @@ class Memory(MemoryBase):
             logger.warning(f"Batch entity linking failed: {e}")
 
         # Phase 8: Save messages + return
-        self.db.save_messages(messages, session_scope)
+        if not skip_doc_history:
+            self.db.save_messages(messages, session_scope)
 
         returned_memories = [
             {"id": r[0], "memory": r[1], "event": "ADD"}
@@ -2820,7 +2828,10 @@ class AsyncMemory(MemoryBase):
 
         # Phase 0: Context gathering
         session_scope = _build_session_scope(effective_filters)
-        last_messages = await asyncio.to_thread(self.db.get_last_messages, session_scope, 10)
+        # DeepMem0: documents don't touch the conversational message history (read
+        # or write) — else chunks bleed into later adds via last_k (proven). See sync.
+        skip_doc_history = temporal_context == "document"
+        last_messages = [] if skip_doc_history else await asyncio.to_thread(self.db.get_last_messages, session_scope, 10)
         parsed_messages = parse_messages(messages)
 
         # Phase 1: Existing memory retrieval
@@ -2896,7 +2907,8 @@ class AsyncMemory(MemoryBase):
             extracted_memories = []
 
         if not extracted_memories:
-            await asyncio.to_thread(self.db.save_messages, messages, session_scope)
+            if not skip_doc_history:
+                await asyncio.to_thread(self.db.save_messages, messages, session_scope)
             return []
 
         # Phase 3: Batch embed all extracted memory texts
@@ -2968,7 +2980,8 @@ class AsyncMemory(MemoryBase):
             records.append((memory_id, text, embed_map[text], mem_metadata))
 
         if not records:
-            await asyncio.to_thread(self.db.save_messages, messages, session_scope)
+            if not skip_doc_history:
+                await asyncio.to_thread(self.db.save_messages, messages, session_scope)
             return []
 
         # Phase 6: Batch persist
@@ -3129,7 +3142,8 @@ class AsyncMemory(MemoryBase):
             logger.warning(f"Batch entity linking failed (async): {e}")
 
         # Phase 8: Save messages + return
-        await asyncio.to_thread(self.db.save_messages, messages, session_scope)
+        if not skip_doc_history:
+            await asyncio.to_thread(self.db.save_messages, messages, session_scope)
 
         returned_memories = [
             {"id": r[0], "memory": r[1], "event": "ADD"}
