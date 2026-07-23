@@ -12,6 +12,15 @@ from mem0.vector_stores.configs import VectorStoreConfig
 home_dir = os.path.expanduser("~")
 mem0_dir = os.environ.get("MEM0_DIR") or os.path.join(home_dir, ".mem0")
 
+# Post-rerank near-tie width in sigmoid(logit) space, shared by every post-rerank
+# tie-breaker (ACT-R activation v0.2, event proximity v0.6). It is a property of
+# the RERANKER's score space, not of any one signal, so there is a single source
+# of truth: candidates whose relevance falls within this band are a genuine tie
+# and may be reordered by a secondary signal; outside it the reranker's order is
+# preserved. Calibrated 2026-07-21 from the golden (real near-ties ~0.0002 vs
+# decisive gaps ~0.038). Re-calibrate if the cross-encoder changes.
+RERANK_TIE_BAND = 0.002
+
 
 class MemoryItem(BaseModel):
     id: str = Field(..., description="The unique identifier for the text data")
@@ -58,7 +67,7 @@ class MemoryDynamicsConfig(BaseModel):
         " 2026-07-21 from the golden: real near-ties ~0.0002 vs decisive gaps ~0.038 (a 190x"
         " separation), so 0.002 breaks ties without overturning decisions. Reranker-dependent:"
         " re-calibrate if the cross-encoder changes. 0 = pure reranker order (no tie-break).",
-        default=0.002,
+        default=RERANK_TIE_BAND,
     )
     reinforcement_window: int = Field(
         description="Seconds after a reinforcement during which further re-encounters of the"
@@ -100,6 +109,43 @@ class MemoryTemporalityConfig(BaseModel):
         description="Ask the extraction LLM for an optional event_date (ISO date) per fact when"
         " the text clearly anchors WHEN it happened. Never blocks the add.",
         default=True,
+    )
+    event_ranking: bool = Field(
+        description="DeepMem0 v0.6: when a query names exactly one date (full date or month+year),"
+        " candidates whose event_date is close get a FUSION boost (pool shaping) and a post-rerank"
+        " TIE-BREAKER preference within the reranker tie band. Memories without an event_date stay"
+        " neutral. Also gates the explicit event_from/event_to window filter's auto-anchor"
+        " suppression. Disabling it leaves as_of/supersession untouched.",
+        default=True,
+    )
+    event_ranking_weight: float = Field(
+        description="Weight of the event-proximity term at the FUSION stage only (grows the adaptive"
+        " divisor like dynamics.weight). 0 disables the fusion term entirely (tie-break still runs) —"
+        " the escape hatch that removes any interaction with the superseded penalty's normalization."
+        " Never additive post-rerank.",
+        default=0.15,
+        ge=0,
+    )
+    event_window_days: int = Field(
+        description="Days from the anchor window's edge at which event proximity reaches 0 (linear"
+        " kernel). Governs both the fusion term and the tie-break.",
+        default=30,
+        ge=1,
+    )
+    event_tie_band: float = Field(
+        description="Post-rerank near-tie width (sigmoid space) for the EVENT-proximity tie-break,"
+        " applied ONLY on queries that name a date. Defaults to the shared RERANK_TIE_BAND (0.002)"
+        " — the conservative, no-new-magic-number choice: event proximity breaks the SAME genuine"
+        " reranker near-ties ACT-R does, no wider. It is a SEPARATE knob (not shared) so it can be"
+        " widened AFTER held-out calibration: the event tie-break is decoupled from the activation"
+        " tie-break (each reorders only within its own band), so widening this never widens the"
+        " ACT-R window. Bounded — a decisive reranker margin (>> this band) is never overturned."
+        " 0 = event proximity cannot reorder post-rerank. NOTE: raising this above 0.002 without"
+        " calibration data is not validated (measured 2026-07-23: real near-duplicate twins sit at"
+        " ~0.0021, right at the ACT-R threshold; a wider band risks promoting date-matching but"
+        " topically-wrong candidates on close topical negatives — see roadmap follow-up).",
+        default=RERANK_TIE_BAND,
+        ge=0,
     )
 
 

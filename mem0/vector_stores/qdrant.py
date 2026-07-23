@@ -194,11 +194,13 @@ class Qdrant(VectorStoreBase):
             except Exception as e:
                 logger.debug(f"Index for {field} might already exist: {e}")
 
-        # DeepMem0 v0.3: datetime indexes for the as-of anchor (created_at is
-        # filtered on every anchored search) and for future supersession-window
-        # filters. Index creation is online — existing collections gain these
-        # on the next startup without re-indexing any vectors.
-        datetime_fields = ["created_at", "superseded_at"]
+        # DeepMem0 v0.3/v0.6: datetime indexes for the as-of anchor (created_at is
+        # filtered on every anchored search), supersession-window filters, and the
+        # v0.6 event-time window filter (event_date). Index creation is online —
+        # existing collections gain these on the next startup without re-indexing
+        # any vectors; the event_date range filter still works before the index
+        # exists (via scan), just slower.
+        datetime_fields = ["created_at", "superseded_at", "event_date"]
 
         for field in datetime_fields:
             try:

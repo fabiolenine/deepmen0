@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from pydantic import ValidationError
 
-from mem0.configs.base import MemoryConfig, MemoryItem
+from mem0.configs.base import RERANK_TIE_BAND, MemoryConfig, MemoryItem
 from mem0.configs.enums import MemoryType
 from mem0.configs.prompts import (
     ADDITIVE_EXTRACTION_PROMPT,
@@ -82,9 +82,13 @@ from mem0.utils.scoring import (
     score_and_rank,
 )
 from mem0.utils.temporality import (
+    FIELD_EVENT_DATE,
     FIELD_SUPERSEDED_AT,
     FIELD_SUPERSEDED_BY,
     FIELD_SUPERSEDES,
+    event_proximity,
+    expand_event_window,
+    infer_event_anchor_from_query,
     infer_event_date_from_text,
     parse_as_of,
     parse_event_date,
@@ -566,32 +570,44 @@ def _reinforce_hits_in_background(vector_store, dyn, memory_ids) -> None:
     threading.Thread(target=_run, daemon=True, name="deepmem0-reinforce").start()
 
 
-def _apply_post_rerank_adjustments(memories, dyn=None, temp=None, as_of=None) -> List[Dict[str, Any]]:
-    """Blend ACT-R activation (v0.2) and the superseded penalty (v0.3) into the
-    reranked order.
+def _apply_post_rerank_adjustments(memories, dyn=None, temp=None, as_of=None, event_anchor=None) -> List[Dict[str, Any]]:
+    """Blend ACT-R activation (v0.2), the superseded penalty (v0.3) and event-time
+    proximity (v0.6) into the reranked order.
 
     RELEVANCE is the sigmoid of the cross-encoder logit; the superseded penalty
     (v0.3) is subtracted from it — deliberately strong enough that a superseded
     fact loses to its current replacement even when slightly more similar, waived
     for memories superseded only after an ``as_of`` anchor.
 
-    ACT-R activation (v0.2) is a BOUNDED TIE-BREAKER, not an additive term.
-    Measured 2026-07-21: the additive form (``base + weight*activation``)
-    overturned DECISIVE reranker gaps because the sigmoid compresses small logits
-    into a narrow band around 0.5 — a 0.15-logit reranker preference became a
-    0.06 sigmoid gap that a reinforced 0.08 boost flipped. The factorial ablation
-    over the golden showed the additive form was net-negative (hit@1 0.914 vs
-    0.943 without it). So activation now only reorders candidates that are within
-    ``dyn.tie_band`` of each other in relevance — a genuine reranker tie — and
-    never touches a decision the reranker made with margin. This delivers the
-    docstring's original intent, which the additive code did not. Memories
-    without dynamics/temporality fields keep their reranked order.
+    ACT-R activation (v0.2) and event proximity (v0.6) are BOUNDED TIE-BREAKERS,
+    never additive terms. Measured 2026-07-21: the additive form
+    (``base + weight*activation``) overturned DECISIVE reranker gaps because the
+    sigmoid compresses small logits into a narrow band around 0.5 — a 0.15-logit
+    reranker preference became a 0.06 sigmoid gap that a reinforced 0.08 boost
+    flipped. The factorial ablation over the golden showed the additive form was
+    net-negative (hit@1 0.914 vs 0.943 without it). So these signals only reorder
+    candidates that are within the shared reranker tie band of each other — a
+    genuine reranker tie — and never touch a decision the reranker made with
+    margin. Within a tie, the secondary key is ``(event_proximity, activation)``:
+    an explicit date named in the query is a stronger intent signal than usage
+    recency, so proximity precedes activation; with no anchor, every proximity is
+    0.0 and ordering falls through to activation exactly as before. Memories
+    without dynamics/temporality/event fields keep their reranked order.
     """
     dyn_active = dyn is not None and dyn.weight > 0
     temp_active = temp is not None and temp.superseded_penalty > 0
-    if not memories or (not dyn_active and not temp_active):
+    # v0.6 tie-break runs whenever event_ranking is on and the query has an anchor
+    # — INDEPENDENT of event_ranking_weight (weight only gates the fusion term, so
+    # weight=0 is a pure tie-break mode with zero divisor interaction).
+    event_active = (
+        temp is not None
+        and getattr(temp, "event_ranking", False)
+        and event_anchor is not None
+    )
+    if not memories or (not dyn_active and not temp_active and not event_active):
         return memories
     now = _dynamics_utcnow()
+    event_window_days = getattr(temp, "event_window_days", 30) if temp is not None else 30
     enriched = []
     for doc in memories:
         meta = doc.get("metadata") or {}
@@ -613,6 +629,11 @@ def _apply_post_rerank_adjustments(memories, dyn=None, temp=None, as_of=None) ->
             )
             if boost > 0:
                 doc["activation"] = round(boost, 4)
+        eprox = 0.0
+        if event_active:
+            eprox = event_proximity(event_anchor, meta.get(FIELD_EVENT_DATE), event_window_days)
+            if eprox > 0:
+                doc["event_proximity"] = round(eprox, 4)
         if temp_active and superseded_penalty_applies(
             {
                 FIELD_SUPERSEDED_BY: meta.get(FIELD_SUPERSEDED_BY),
@@ -622,31 +643,45 @@ def _apply_post_rerank_adjustments(memories, dyn=None, temp=None, as_of=None) ->
         ):
             doc["superseded_penalty"] = temp.superseded_penalty
             base -= temp.superseded_penalty
-        enriched.append({"doc": doc, "base": base, "boost": boost})
+        enriched.append({"doc": doc, "base": base, "boost": boost, "eprox": eprox})
 
     # Primary order: relevance (reranker sigmoid minus superseded penalty).
     enriched.sort(key=lambda e: e["base"], reverse=True)
-    if not dyn_active:
+    if not dyn_active and not event_active:
         return [e["doc"] for e in enriched]
 
-    # Tie-break: within each run of candidates whose relevance is within
-    # tie_band of the run's leader (a genuine reranker tie), the more-activated
-    # memory wins. Outside the band, the reranker's decision stands untouched.
-    band = getattr(dyn, "tie_band", 0.0) or 0.0
-    if band <= 0:
-        # tie_band disabled → activation cannot reorder anything post-rerank.
-        return [e["doc"] for e in enriched]
-    ordered, i, n = [], 0, len(enriched)
-    while i < n:
-        leader = enriched[i]["base"]
-        j = i + 1
-        while j < n and leader - enriched[j]["base"] < band:
-            j += 1
-        group = enriched[i:j]
-        group.sort(key=lambda e: e["boost"], reverse=True)
-        ordered.extend(e["doc"] for e in group)
-        i = j
-    return ordered
+    # Tie-break: two DECOUPLED stable passes, each reordering only within runs of
+    # candidates whose relevance is within its OWN band of the run leader (a
+    # genuine reranker tie); outside the band the reranker's decision stands. The
+    # passes use independent bands so widening one never widens the other — the
+    # activation window (ACT-R, dyn.tie_band) stays tight even on a dated query
+    # where the event band may be wider. Activation runs first, then event, so an
+    # explicit date in the query (a deliberate intent signal) takes precedence
+    # over usage recency within its band while activation still breaks the tighter
+    # ties it owns. Neither can overturn a decisive reranker margin (>> its band).
+    def _tie_pass(items, band, key):
+        band = band or 0.0
+        if band <= 0:
+            return items
+        out, i, n = [], 0, len(items)
+        while i < n:
+            leader = items[i]["base"]
+            j = i + 1
+            while j < n and leader - items[j]["base"] < band:
+                j += 1
+            group = items[i:j]
+            group.sort(key=key, reverse=True)  # stable: equal keys keep prior order
+            out.extend(group)
+            i = j
+        return out
+
+    if dyn_active:
+        act_band = dyn.tie_band if dyn is not None else RERANK_TIE_BAND
+        enriched = _tie_pass(enriched, act_band, lambda e: e["boost"])
+    if event_active:
+        ev_band = getattr(temp, "event_tie_band", RERANK_TIE_BAND)
+        enriched = _tie_pass(enriched, ev_band, lambda e: e["eprox"])
+    return [e["doc"] for e in enriched]
 
 
 def _apply_activation_post_rerank(memories, dyn) -> List[Dict[str, Any]]:
@@ -1644,6 +1679,8 @@ class Memory(MemoryBase):
         memory_type: Optional[str] = None,
         sort_by_importance: bool = False,
         as_of: Optional[str] = None,
+        event_from: Optional[str] = None,
+        event_to: Optional[str] = None,
         **kwargs,
     ):
         """
@@ -1676,10 +1713,24 @@ class Memory(MemoryBase):
             rerank (bool, optional): Whether to rerank results. Defaults to False.
             explain (bool, optional): Whether to include score_details for each result. Defaults to False.
             reference_date (Any, optional): Platform-only temporal parameter. Not supported in OSS.
+            as_of (str, optional): DeepMem0 v0.3 RECORD-time anchor (ISO date/datetime) — restrict
+                results to memories that already existed then (filters on created_at) and restore
+                the world as it was. Answers "what did I know on X". DeepMem0 runtime only.
+            event_from (str, optional): DeepMem0 v0.6 EVENT-time window start (inclusive). Full or
+                partial ISO date — "2023" = whole year, "2023-10" = whole month, "2023-10-17" = day.
+                Filters on event_date (WHEN the fact happened, distinct from as_of's record-time).
+                Memories without an event_date are EXCLUDED while the window is active. One side
+                alone = open interval. DeepMem0 runtime only.
+            event_to (str, optional): DeepMem0 v0.6 EVENT-time window end (inclusive), same partial
+                expansion. When neither event_from/event_to is given, a single date named in the
+                query auto-anchors ranking (event_ranking) without filtering anything out.
 
         Returns:
             dict: A dictionary containing the search results under a "results" key.
                   Example for v1.1+: `{"results": [{"id": "...", "memory": "...", "score": 0.8, ...}]}`
+                  DeepMem0 also echoes "as_of" (record-time anchor), "event_anchor" ({"from","to"}
+                  auto-detected from the query) OR "event_filter" ({"from","to"} explicit window;
+                  mutually exclusive with event_anchor) when those apply.
 
         Raises:
             ValueError: If filters doesn't contain at least one of user_id, agent_id, run_id,
@@ -1692,6 +1743,14 @@ class Memory(MemoryBase):
         as_of_iso, as_of_dt = (None, None)
         if as_of is not None and _temporality_config(self.config) is not None:
             as_of_iso, as_of_dt = parse_as_of(as_of)
+
+        # DeepMem0 v0.6: event-time window — validate caller bounds fail-fast
+        # (mirrors as_of) EVEN when temporality is off, so a malformed date is
+        # never a config-dependent silent no-op. Application is gated below.
+        event_from_iso, event_to_iso = (None, None)
+        if event_from is not None or event_to is not None:
+            event_from_iso, event_to_iso = expand_event_window(event_from, event_to)
+        event_anchor = None
 
         # Reject top-level entity params - must use filters instead
         _scope_kwargs = _extract_top_level_entity_params(kwargs)
@@ -1752,6 +1811,43 @@ class Memory(MemoryBase):
             else:
                 effective_filters["created_at"] = {"lte": as_of_iso}
 
+        # DeepMem0 v0.6: auto-detect a single event-time expression in the query
+        # for ranking — suppressed when the caller passed an explicit window (they
+        # already stated intent). Gated by event_ranking; the fusion term is
+        # separately gated by event_ranking_weight > 0 downstream. Placed after
+        # filter validation so self.config is only touched once the request is
+        # well-formed (mirrors as_of's post-validation config access).
+        _search_config = getattr(self, "config", None)
+        if event_from_iso is None and event_to_iso is None and _search_config is not None:
+            _ev_cfg = _temporality_config(_search_config)
+            if _ev_cfg is not None and getattr(_ev_cfg, "event_ranking", False):
+                event_anchor = infer_event_anchor_from_query(query)
+
+        # DeepMem0 v0.6: explicit event-time window filter (event_date range).
+        # Record-time as_of and event-time window compose (AND'ed in the store).
+        # Applied only when temporality is enabled (mirror as_of). A FRESH nested
+        # dict is written so the caller's filter object is never mutated; an
+        # existing event_date bound is tightened, never loosened. Undated memories
+        # never match a range on a missing field, so they drop out of the window.
+        if (event_from_iso is not None or event_to_iso is not None) and _temporality_config(self.config) is not None:
+            bound = {}
+            if event_from_iso is not None:
+                bound["gte"] = event_from_iso
+            if event_to_iso is not None:
+                bound["lte"] = event_to_iso
+            existing_event = effective_filters.get(FIELD_EVENT_DATE)
+            if isinstance(existing_event, dict):
+                merged = dict(existing_event)
+                if "gte" in bound:
+                    cur = merged.get("gte")
+                    merged["gte"] = max(cur, bound["gte"]) if isinstance(cur, str) else bound["gte"]
+                if "lte" in bound:
+                    cur = merged.get("lte")
+                    merged["lte"] = min(cur, bound["lte"]) if isinstance(cur, str) else bound["lte"]
+                effective_filters[FIELD_EVENT_DATE] = merged
+            else:
+                effective_filters[FIELD_EVENT_DATE] = bound
+
         keys, encoded_ids = process_telemetry_filters(effective_filters)
         capture_event(
             "mem0.search",
@@ -1785,6 +1881,7 @@ class Memory(MemoryBase):
             query, effective_filters, fetch_limit, threshold, explain=explain, as_of_dt=as_of_dt,
             dense_anchors=(getattr(self.config, "rerank_dense_anchors", 5)
                            if (rerank and self.reranker) else 0),
+            event_anchor=event_anchor,
         )
         search_elapsed_seconds = time.perf_counter() - search_start
 
@@ -1801,7 +1898,7 @@ class Memory(MemoryBase):
                 temp = _temporality_config(self.config)
                 if dyn is not None or temp is not None:
                     original_memories = _apply_post_rerank_adjustments(
-                        original_memories, dyn=dyn, temp=temp, as_of=as_of_dt
+                        original_memories, dyn=dyn, temp=temp, as_of=as_of_dt, event_anchor=event_anchor
                     )
             except Exception as e:
                 logger.warning(f"Reranking failed, using original results: {e}")
@@ -1842,6 +1939,14 @@ class Memory(MemoryBase):
         response = {"results": original_memories}
         if as_of_iso is not None:
             response["as_of"] = as_of_iso
+        # DeepMem0 v0.6: echo the auto-detected ranking anchor OR the explicit
+        # filter window (mutually exclusive — an explicit window suppresses
+        # auto-detection). event_anchor is echoed whenever an anchor was found,
+        # independent of whether any candidate matched it.
+        if event_anchor is not None:
+            response["event_anchor"] = {"from": event_anchor[0], "to": event_anchor[1]}
+        elif event_from_iso is not None or event_to_iso is not None:
+            response["event_filter"] = {"from": event_from_iso, "to": event_to_iso}
         return response
 
     def _process_metadata_filters(self, metadata_filters: Dict[str, Any]) -> Dict[str, Any]:
@@ -1948,7 +2053,7 @@ class Memory(MemoryBase):
                 return True
         return False
 
-    def _search_vector_store(self, query, filters, limit, threshold=0.1, explain=False, as_of_dt=None, dense_anchors=0):
+    def _search_vector_store(self, query, filters, limit, threshold=0.1, explain=False, as_of_dt=None, dense_anchors=0, event_anchor=None):
         # Guard against None threshold (backward compat)
         if threshold is None:
             threshold = 0.1
@@ -2018,6 +2123,19 @@ class Memory(MemoryBase):
                 if superseded_penalty_applies(cand["payload"], as_of=as_of_dt):
                     superseded_penalties[cand["id"]] = temp.superseded_penalty
 
+        # Step 7d (DeepMem0 v0.6): event-time proximity boosts over the candidate
+        # pool when the query named a date. FUSION-stage only, gated by
+        # event_ranking_weight > 0 (weight=0 => tie-break-only, no divisor growth).
+        # Memories without an event_date stay neutral (no key in the dict).
+        event_boosts = {}
+        if (temp is not None and getattr(temp, "event_ranking", False)
+                and temp.event_ranking_weight > 0 and event_anchor):
+            event_window_days = getattr(temp, "event_window_days", 30)
+            for cand in candidates:
+                prox = event_proximity(event_anchor, (cand["payload"] or {}).get(FIELD_EVENT_DATE), event_window_days)
+                if prox > 0:
+                    event_boosts[cand["id"]] = prox
+
         # Step 8: Score and rank
         scored_results = score_and_rank(
             semantic_results=candidates,
@@ -2029,6 +2147,8 @@ class Memory(MemoryBase):
             activation_boosts=activation_boosts,
             activation_weight=dyn.weight if dyn is not None else 0.0,
             penalties=superseded_penalties or None,
+            event_boosts=event_boosts or None,
+            event_weight=temp.event_ranking_weight if temp is not None else 0.0,
         )
 
         # DeepMem0: DENSE ANCHORS — a fusão corta o pool por score FUNDIDO, então
@@ -3402,6 +3522,8 @@ class AsyncMemory(MemoryBase):
         memory_type: Optional[str] = None,
         sort_by_importance: bool = False,
         as_of: Optional[str] = None,
+        event_from: Optional[str] = None,
+        event_to: Optional[str] = None,
         **kwargs,
     ):
         """
@@ -3434,10 +3556,24 @@ class AsyncMemory(MemoryBase):
             rerank (bool, optional): Whether to rerank results. Defaults to False.
             explain (bool, optional): Whether to include score_details for each result. Defaults to False.
             reference_date (Any, optional): Platform-only temporal parameter. Not supported in OSS.
+            as_of (str, optional): DeepMem0 v0.3 RECORD-time anchor (ISO date/datetime) — restrict
+                results to memories that already existed then (filters on created_at) and restore
+                the world as it was. Answers "what did I know on X". DeepMem0 runtime only.
+            event_from (str, optional): DeepMem0 v0.6 EVENT-time window start (inclusive). Full or
+                partial ISO date — "2023" = whole year, "2023-10" = whole month, "2023-10-17" = day.
+                Filters on event_date (WHEN the fact happened, distinct from as_of's record-time).
+                Memories without an event_date are EXCLUDED while the window is active. One side
+                alone = open interval. DeepMem0 runtime only.
+            event_to (str, optional): DeepMem0 v0.6 EVENT-time window end (inclusive), same partial
+                expansion. When neither event_from/event_to is given, a single date named in the
+                query auto-anchors ranking (event_ranking) without filtering anything out.
 
         Returns:
             dict: A dictionary containing the search results under a "results" key.
                   Example for v1.1+: `{"results": [{"id": "...", "memory": "...", "score": 0.8, ...}]}`
+                  DeepMem0 also echoes "as_of" (record-time anchor), "event_anchor" ({"from","to"}
+                  auto-detected from the query) OR "event_filter" ({"from","to"} explicit window;
+                  mutually exclusive with event_anchor) when those apply.
 
         Raises:
             ValueError: If filters doesn't contain at least one of user_id, agent_id, run_id,
@@ -3452,6 +3588,14 @@ class AsyncMemory(MemoryBase):
         as_of_iso, as_of_dt = (None, None)
         if as_of is not None and _temporality_config(self.config) is not None:
             as_of_iso, as_of_dt = parse_as_of(as_of)
+
+        # DeepMem0 v0.6: event-time window — validate caller bounds fail-fast
+        # (mirrors as_of) EVEN when temporality is off, so a malformed date is
+        # never a config-dependent silent no-op. Application is gated below.
+        event_from_iso, event_to_iso = (None, None)
+        if event_from is not None or event_to is not None:
+            event_from_iso, event_to_iso = expand_event_window(event_from, event_to)
+        event_anchor = None
 
         # Reject top-level entity params - must use filters instead
         _scope_kwargs = _extract_top_level_entity_params(kwargs)
@@ -3514,6 +3658,43 @@ class AsyncMemory(MemoryBase):
             else:
                 effective_filters["created_at"] = {"lte": as_of_iso}
 
+        # DeepMem0 v0.6: auto-detect a single event-time expression in the query
+        # for ranking — suppressed when the caller passed an explicit window (they
+        # already stated intent). Gated by event_ranking; the fusion term is
+        # separately gated by event_ranking_weight > 0 downstream. Placed after
+        # filter validation so self.config is only touched once the request is
+        # well-formed (mirrors as_of's post-validation config access).
+        _search_config = getattr(self, "config", None)
+        if event_from_iso is None and event_to_iso is None and _search_config is not None:
+            _ev_cfg = _temporality_config(_search_config)
+            if _ev_cfg is not None and getattr(_ev_cfg, "event_ranking", False):
+                event_anchor = infer_event_anchor_from_query(query)
+
+        # DeepMem0 v0.6: explicit event-time window filter (event_date range).
+        # Record-time as_of and event-time window compose (AND'ed in the store).
+        # Applied only when temporality is enabled (mirror as_of). A FRESH nested
+        # dict is written so the caller's filter object is never mutated; an
+        # existing event_date bound is tightened, never loosened. Undated memories
+        # never match a range on a missing field, so they drop out of the window.
+        if (event_from_iso is not None or event_to_iso is not None) and _temporality_config(self.config) is not None:
+            bound = {}
+            if event_from_iso is not None:
+                bound["gte"] = event_from_iso
+            if event_to_iso is not None:
+                bound["lte"] = event_to_iso
+            existing_event = effective_filters.get(FIELD_EVENT_DATE)
+            if isinstance(existing_event, dict):
+                merged = dict(existing_event)
+                if "gte" in bound:
+                    cur = merged.get("gte")
+                    merged["gte"] = max(cur, bound["gte"]) if isinstance(cur, str) else bound["gte"]
+                if "lte" in bound:
+                    cur = merged.get("lte")
+                    merged["lte"] = min(cur, bound["lte"]) if isinstance(cur, str) else bound["lte"]
+                effective_filters[FIELD_EVENT_DATE] = merged
+            else:
+                effective_filters[FIELD_EVENT_DATE] = bound
+
         keys, encoded_ids = process_telemetry_filters(effective_filters)
         capture_event(
             "mem0.search",
@@ -3547,6 +3728,7 @@ class AsyncMemory(MemoryBase):
             query, effective_filters, fetch_limit, threshold, explain=explain, as_of_dt=as_of_dt,
             dense_anchors=(getattr(self.config, "rerank_dense_anchors", 5)
                            if (rerank and self.reranker) else 0),
+            event_anchor=event_anchor,
         )
         search_elapsed_seconds = time.perf_counter() - search_start
 
@@ -3563,7 +3745,7 @@ class AsyncMemory(MemoryBase):
                 temp = _temporality_config(self.config)
                 if dyn is not None or temp is not None:
                     original_memories = _apply_post_rerank_adjustments(
-                        original_memories, dyn=dyn, temp=temp, as_of=as_of_dt
+                        original_memories, dyn=dyn, temp=temp, as_of=as_of_dt, event_anchor=event_anchor
                     )
             except Exception as e:
                 logger.warning(f"Reranking failed, using original results: {e}")
@@ -3602,6 +3784,14 @@ class AsyncMemory(MemoryBase):
         response = {"results": original_memories}
         if as_of_iso is not None:
             response["as_of"] = as_of_iso
+        # DeepMem0 v0.6: echo the auto-detected ranking anchor OR the explicit
+        # filter window (mutually exclusive — an explicit window suppresses
+        # auto-detection). event_anchor is echoed whenever an anchor was found,
+        # independent of whether any candidate matched it.
+        if event_anchor is not None:
+            response["event_anchor"] = {"from": event_anchor[0], "to": event_anchor[1]}
+        elif event_from_iso is not None or event_to_iso is not None:
+            response["event_filter"] = {"from": event_from_iso, "to": event_to_iso}
         return response
 
     def _process_metadata_filters(self, metadata_filters: Dict[str, Any]) -> Dict[str, Any]:
@@ -3708,7 +3898,7 @@ class AsyncMemory(MemoryBase):
                 return True
         return False
 
-    async def _search_vector_store(self, query, filters, limit, threshold=0.1, explain=False, as_of_dt=None, dense_anchors=0):
+    async def _search_vector_store(self, query, filters, limit, threshold=0.1, explain=False, as_of_dt=None, dense_anchors=0, event_anchor=None):
         if threshold is None:
             threshold = 0.1
 
@@ -3775,6 +3965,19 @@ class AsyncMemory(MemoryBase):
                 if superseded_penalty_applies(cand["payload"], as_of=as_of_dt):
                     superseded_penalties[cand["id"]] = temp.superseded_penalty
 
+        # Step 7d (DeepMem0 v0.6): event-time proximity boosts over the candidate
+        # pool when the query named a date. FUSION-stage only, gated by
+        # event_ranking_weight > 0 (weight=0 => tie-break-only, no divisor growth).
+        # Memories without an event_date stay neutral (no key in the dict).
+        event_boosts = {}
+        if (temp is not None and getattr(temp, "event_ranking", False)
+                and temp.event_ranking_weight > 0 and event_anchor):
+            event_window_days = getattr(temp, "event_window_days", 30)
+            for cand in candidates:
+                prox = event_proximity(event_anchor, (cand["payload"] or {}).get(FIELD_EVENT_DATE), event_window_days)
+                if prox > 0:
+                    event_boosts[cand["id"]] = prox
+
         # Step 8: Score and rank
         scored_results = score_and_rank(
             semantic_results=candidates,
@@ -3786,6 +3989,8 @@ class AsyncMemory(MemoryBase):
             activation_boosts=activation_boosts,
             activation_weight=dyn.weight if dyn is not None else 0.0,
             penalties=superseded_penalties or None,
+            event_boosts=event_boosts or None,
+            event_weight=temp.event_ranking_weight if temp is not None else 0.0,
         )
 
         # DeepMem0: DENSE ANCHORS — a fusão corta o pool por score FUNDIDO, então

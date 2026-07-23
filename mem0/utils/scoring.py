@@ -56,6 +56,7 @@ def normalize_bm25(raw_score: float, midpoint: float, steepness: float) -> float
 
 ENTITY_BOOST_WEIGHT = 0.5
 ACTIVATION_BOOST_WEIGHT = 0.15
+EVENT_BOOST_WEIGHT = 0.15
 
 
 def score_and_rank(
@@ -68,12 +69,14 @@ def score_and_rank(
     activation_boosts: Optional[Dict[str, float]] = None,
     activation_weight: float = ACTIVATION_BOOST_WEIGHT,
     penalties: Optional[Dict[str, float]] = None,
+    event_boosts: Optional[Dict[str, float]] = None,
+    event_weight: float = EVENT_BOOST_WEIGHT,
 ) -> List[Dict[str, Any]]:
     """Score candidates additively and return top-k results.
 
     For each candidate:
         semantic_score is taken from the result's score field.
-        combined = (semantic + bm25 + entity_boost + activation) / max_possible
+        combined = (semantic + bm25 + entity_boost + activation + event) / max_possible
         combined = max(combined - penalty, 0.0)   # DeepMem0 v0.3
 
     Threshold gates the semantic score BEFORE combining -- candidates
@@ -87,6 +90,7 @@ def score_and_rank(
         - Semantic + BM25 + entity: max_possible = 2.5
         - Semantic + entity (no BM25): max_possible = 1.5
         - + activation (DeepMem0 v0.2): max_possible += activation_weight
+        - + event proximity (DeepMem0 v0.6): max_possible += event_weight
 
     Args:
         semantic_results: Candidate memories from vector search.
@@ -100,6 +104,12 @@ def score_and_rank(
         activation_weight: Weight of the activation term.
         penalties: DeepMem0 v0.3 — score penalties (e.g. superseded facts)
             keyed by memory ID, subtracted from the final normalized score.
+        event_boosts: DeepMem0 v0.6 — event-time proximity boosts in [0, 1]
+            keyed by memory ID (a query names a date, matching event_dates score
+            higher). Memories absent from the dict are neutral. An empty/None dict
+            leaves the divisor unchanged, so a query with no temporal anchor is a
+            no-op here.
+        event_weight: Weight of the event-proximity term. 0 disables it.
 
     Returns:
         List of scored result dicts sorted by combined score descending.
@@ -107,6 +117,7 @@ def score_and_rank(
     has_bm25 = bool(bm25_scores)
     has_entity = bool(entity_boosts)
     has_activation = bool(activation_boosts) and activation_weight > 0
+    has_event = bool(event_boosts) and event_weight > 0
 
     max_possible = 1.0
     if has_bm25:
@@ -115,6 +126,8 @@ def score_and_rank(
         max_possible += ENTITY_BOOST_WEIGHT
     if has_activation:
         max_possible += activation_weight
+    if has_event:
+        max_possible += event_weight
 
     scored: List[Dict[str, Any]] = []
 
@@ -131,8 +144,9 @@ def score_and_rank(
         bm25_score = bm25_scores.get(mem_id_str, 0.0)
         entity_boost = entity_boosts.get(mem_id_str, 0.0)
         activation = (activation_boosts.get(mem_id_str, 0.0) * activation_weight) if has_activation else 0.0
+        event = (event_boosts.get(mem_id_str, 0.0) * event_weight) if has_event else 0.0
 
-        raw_combined = semantic_score + bm25_score + entity_boost + activation
+        raw_combined = semantic_score + bm25_score + entity_boost + activation + event
         combined = min(raw_combined / max_possible, 1.0)
         penalty = (penalties or {}).get(mem_id_str, 0.0)
         if penalty:
@@ -149,6 +163,7 @@ def score_and_rank(
                 "bm25_score": bm25_score,
                 "entity_boost": entity_boost,
                 "activation_boost": activation,
+                "event_boost": event,
                 "superseded_penalty": penalty,
                 "raw_score": raw_combined,
                 "max_possible_score": max_possible,

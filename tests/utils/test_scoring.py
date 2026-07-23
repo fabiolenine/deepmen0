@@ -144,6 +144,9 @@ class TestScoreAndRank:
             "semantic_score": 0.8,
             "bm25_score": 0.6,
             "entity_boost": 0.3,
+            "activation_boost": 0.0,  # DeepMem0 v0.2
+            "event_boost": 0.0,  # DeepMem0 v0.6
+            "superseded_penalty": 0.0,  # DeepMem0 v0.3
             "raw_score": pytest.approx(1.7),
             "max_possible_score": 2.5,
             "final_score": pytest.approx(0.68),

@@ -28,6 +28,7 @@ fail-fast for caller-provided parameters (an invalid ``as_of`` raises).
 
 from __future__ import annotations
 
+import calendar
 import logging
 import re
 from datetime import datetime, time, timezone
@@ -111,6 +112,46 @@ _NAME_DATE_MF_RE = re.compile(
     r"\b([A-Za-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})\b",
     re.IGNORECASE,
 )
+# month + year, NO day (v0.6 query anchor): "outubro de 2023", "October 2023", "10/2023"
+_NAME_MONTH_YEAR_RE = re.compile(
+    r"\b(?:de\s+|of\s+)?([A-Za-zçÇ]+)\s+(?:de\s+|of\s+)?(\d{4})\b",
+    re.IGNORECASE,
+)
+_NUM_MONTH_YEAR_RE = re.compile(r"\b(\d{1,2})/(\d{4})\b")
+
+
+def _iter_full_date_matches(text: str) -> List[Tuple[Tuple[int, int], Tuple[int, int, int]]]:
+    """Single source of full-date extraction: yield (span, (y, m, d)) for every
+    valid full date in the text (day+month+year). Two-digit years -> 20YY.
+
+    Both ``infer_event_date_from_text`` (persistence) and
+    ``infer_event_anchor_from_query`` (query anchoring) build on this so the two
+    never diverge. Order-preserving list (not a set) because the query anchor
+    needs spans to suppress month-year matches nested inside a full date.
+    """
+    out: List[Tuple[Tuple[int, int], Tuple[int, int, int]]] = []
+    for m_ in _ISO_TXT_RE.finditer(text):
+        out.append((m_.span(), (int(m_.group(1)), int(m_.group(2)), int(m_.group(3)))))
+    for m_ in _NUM_DATE_RE.finditer(text):
+        d, mo, yy = m_.group(1), m_.group(2), m_.group(3)
+        year = int(yy) if len(yy) == 4 else 2000 + int(yy)
+        out.append((m_.span(), (year, int(mo), int(d))))
+    for m_ in _NAME_DATE_RE.finditer(text):
+        month = _MONTHS.get(m_.group(2).lower())
+        if month:
+            out.append((m_.span(), (int(m_.group(3)), month, int(m_.group(1)))))
+    for m_ in _NAME_DATE_MF_RE.finditer(text):
+        month = _MONTHS.get(m_.group(1).lower())
+        if month:
+            out.append((m_.span(), (int(m_.group(3)), month, int(m_.group(2)))))
+    valid: List[Tuple[Tuple[int, int], Tuple[int, int, int]]] = []
+    for span, (y, m, d) in out:
+        try:
+            datetime(year=y, month=m, day=d)
+        except ValueError:
+            continue
+        valid.append((span, (y, m, d)))
+    return valid
 
 
 def infer_event_date_from_text(text: Any) -> Optional[str]:
@@ -124,31 +165,125 @@ def infer_event_date_from_text(text: Any) -> Optional[str]:
     """
     if not isinstance(text, str) or not text:
         return None
-    found: set = set()
-    for y, m, d in _ISO_TXT_RE.findall(text):
-        found.add((int(y), int(m), int(d)))
-    for d, m, y in _NUM_DATE_RE.findall(text):
-        year = int(y) if len(y) == 4 else 2000 + int(y)
-        found.add((year, int(m), int(d)))
-    for d, mname, y in _NAME_DATE_RE.findall(text):
-        month = _MONTHS.get(mname.lower())
-        if month:
-            found.add((int(y), month, int(d)))
-    for mname, d, y in _NAME_DATE_MF_RE.findall(text):
-        month = _MONTHS.get(mname.lower())
-        if month:
-            found.add((int(y), month, int(d)))
-    valid = set()
-    for y, m, d in found:
-        try:
-            datetime(year=y, month=m, day=d)
-        except ValueError:
-            continue
-        valid.add((y, m, d))
+    valid = {v for _, v in _iter_full_date_matches(text)}
     if len(valid) != 1:
         return None
     y, m, d = next(iter(valid))
     return f"{y:04d}-{m:02d}-{d:02d}"
+
+
+def _spans_overlap(a: Tuple[int, int], b: Tuple[int, int]) -> bool:
+    return not (a[1] <= b[0] or a[0] >= b[1])
+
+
+def _iter_month_year_matches(
+    text: str, day_spans: List[Tuple[int, int]]
+) -> List[Tuple[int, int]]:
+    """Yield distinct (year, month) for month+year expressions NOT nested inside
+    a full date (e.g. the "outubro de 2023" span of "17 de outubro de 2023" is
+    dropped, so it does not count as a second temporal expression)."""
+    seen: set = set()
+    for m_ in _NAME_MONTH_YEAR_RE.finditer(text):
+        month = _MONTHS.get(m_.group(1).lower())
+        if not month:
+            continue
+        if any(_spans_overlap(m_.span(), ds) for ds in day_spans):
+            continue
+        seen.add((int(m_.group(2)), month))
+    for m_ in _NUM_MONTH_YEAR_RE.finditer(text):
+        month = int(m_.group(1))
+        if not (1 <= month <= 12):
+            continue
+        if any(_spans_overlap(m_.span(), ds) for ds in day_spans):
+            continue
+        seen.add((int(m_.group(2)), month))
+    return list(seen)
+
+
+def infer_event_anchor_from_query(text: Any) -> Optional[Tuple[str, str]]:
+    """Detect a single temporal expression in a QUERY and return an event-time
+    window ``(from_iso, to_iso)`` for ranking.
+
+    Accepts a FULL date (-> that day, ``[d, d]``) or a MONTH+YEAR (-> that whole
+    month, ``[1st, last]``). A bare year does NOT trigger (too weak — a query
+    that merely mentions a year is rarely asking about event-time). Conservative
+    like ``infer_event_date_from_text``: exactly ONE distinct temporal
+    expression, else ``None`` (never guesses which one to anchor on).
+    """
+    if not isinstance(text, str) or not text:
+        return None
+    day_matches = _iter_full_date_matches(text)
+    day_vals = {v for _, v in day_matches}
+    month_vals = _iter_month_year_matches(text, [s for s, _ in day_matches])
+    if len(day_vals) + len(month_vals) != 1:
+        return None
+    if day_vals:
+        y, m, d = next(iter(day_vals))
+        iso = f"{y:04d}-{m:02d}-{d:02d}"
+        return (iso, iso)
+    y, m = month_vals[0]
+    last = calendar.monthrange(y, m)[1]
+    return (f"{y:04d}-{m:02d}-01", f"{y:04d}-{m:02d}-{last:02d}")
+
+
+def _expand_partial_date(value: str, end: bool) -> str:
+    """Expand a partial ISO date to a full ``YYYY-MM-DD`` day (start or end of
+    the implied range). ``end`` picks the last day of the year/month; otherwise
+    the first. Fail-fast ValueError on anything but YYYY / YYYY-MM / YYYY-MM-DD.
+    """
+    v = value.strip()
+    if re.fullmatch(r"\d{4}", v):
+        datetime(int(v), 1, 1)
+        return f"{v}-12-31" if end else f"{v}-01-01"
+    if re.fullmatch(r"\d{4}-\d{2}", v):
+        y, mo = int(v[:4]), int(v[5:7])
+        datetime(y, mo, 1)
+        last = calendar.monthrange(y, mo)[1]
+        return f"{y:04d}-{mo:02d}-{last:02d}" if end else f"{y:04d}-{mo:02d}-01"
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", v):
+        datetime.strptime(v, "%Y-%m-%d")
+        return v
+    raise ValueError(f"Invalid event date {value!r}: expected YYYY, YYYY-MM, or YYYY-MM-DD")
+
+
+def expand_event_window(
+    event_from: Optional[str] = None, event_to: Optional[str] = None
+) -> Tuple[Optional[str], Optional[str]]:
+    """Expand caller-provided partial dates into an inclusive ``[from, to]`` day
+    window (either side may be None = open interval). Fail-fast on unparsable
+    input or ``from > to`` — mirrors ``parse_as_of`` for caller parameters.
+    """
+    lo = _expand_partial_date(event_from, end=False) if event_from is not None else None
+    hi = _expand_partial_date(event_to, end=True) if event_to is not None else None
+    if lo is not None and hi is not None and lo > hi:
+        raise ValueError(f"event_from ({lo}) is after event_to ({hi})")
+    return lo, hi
+
+
+def event_proximity(
+    window: Optional[Tuple[str, str]], event_date: Any, window_days: int = 30
+) -> float:
+    """Linear proximity of a fact's ``event_date`` to an anchor window.
+
+    1.0 inside the window; decaying linearly to 0.0 at ``window_days`` beyond the
+    nearest edge; 0.0 further out. Missing/invalid event_date or window, or a
+    non-positive ``window_days``, all yield 0.0 (neutral — never raises).
+    """
+    if not window or window_days is None or window_days <= 0:
+        return 0.0
+    iso = parse_event_date(event_date)
+    if iso is None:
+        return 0.0
+    try:
+        e = datetime.strptime(iso, "%Y-%m-%d").date()
+        lo = datetime.strptime(window[0], "%Y-%m-%d").date()
+        hi = datetime.strptime(window[1], "%Y-%m-%d").date()
+    except (ValueError, TypeError, IndexError):
+        return 0.0
+    if lo <= e <= hi:
+        return 1.0
+    delta = (lo - e).days if e < lo else (e - hi).days
+    return max(0.0, 1.0 - delta / window_days)
 
 
 def parse_as_of(value: Any) -> Tuple[str, datetime]:
